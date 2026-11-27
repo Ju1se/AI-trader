@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use trade_adapters::{FixtureMarket, PaperBroker};
 use trade_core::{TaskId, TaskTypeConfig, UsdCents};
 use trade_server::{
-    FrameRequest, Framing, Harness, Intake, PAPER_BROKER_KEY, Step, Strategy, load_task_types,
+    FrameRequest, Harness, Intake, PAPER_BROKER_KEY, Step, Strategy, load_task_types,
 };
 use trade_store::Store;
 
@@ -71,12 +71,11 @@ pub fn request(as_of: &str, orders_optional: bool) -> FrameRequest {
 
 /// ADMIT and FRAME a task for `as_of`.
 pub async fn start_with(h: &Harness, as_of: &str, orders_optional: bool) -> TaskId {
-    let (task, _) = h.admit(&intake(&format!("trigger-{as_of}"))).await.unwrap();
-    let framing = h
-        .frame(&task.task_id, &request(as_of, orders_optional))
-        .await
-        .unwrap();
-    assert!(matches!(framing, Framing::Ready(_)), "{framing:?}");
+    let mut request = h.rebalance_request(as_of);
+    request.trigger_key = Some(format!("trigger-{as_of}"));
+    request.orders_optional = orders_optional;
+    let (task, _) = h.start("pm_alice", "test", &request).await.unwrap();
+    assert_eq!(task.state().code(), "RUNNING");
     task.task_id
 }
 

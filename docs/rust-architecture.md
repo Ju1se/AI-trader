@@ -205,7 +205,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 | 图 3b 批准 | store 的批准表和事务;`Harness::decide_approval`(绕开或被否决) | `approval_is_used_once_for_exactly_its_payload`、`a_rejection_after_the_gate_read_wins`、`refused_orders_are_skipped_and_the_draft_delivered_as_partial`、`refusing_a_required_step_declines_the_task` |
 | 图 4a 状态机 | `core/src/state.rs` 的迁移表;store 带版本号的更新 | `transition_table_matches_diagram_4a_exactly`、`random_walks_keep_diagram_invariants`、`stale_copy_cannot_overwrite_a_newer_write` |
 | 图 4b 恢复 | `Harness::reconcile`、`Harness::recover`(启动时);两个工具按幂等键回读 | `a_request_lost_before_the_broker_is_reconciled_and_sent_once`、`a_lost_reply_after_a_fill_is_reconciled_without_a_second_order`、`a_restart_settles_what_a_crash_left_in_flight` |
-| 图 5 场景 | 命令行 `demo`、`research`、`backtest` | `tests/parity.rs` 和 Python 基准逐项比对 |
+| 图 5 场景 | 命令行 `agent`、`research`、`backtest` | `tests/parity.rs` 和 Python 基准逐项比对 |
 | 图 6 收尾与度量 | `Harness::verify`(只读库、行情和券商)、交付、验收、到期结案;store 的单位成本 | `a_tampered_citation_fails_verification_and_goes_to_a_person`、`verification_fails_without_any_evidence`、`spend_limit_sees_every_cost_and_unit_economics_counts_ended_tasks_once` |
 | 图 7 组件 | crate 划分;`server/src/api.rs` 的接口和事件流 | `tests/api.rs` |
 | 图 8 数据模型 | `migrations/0001_schema.sql` | store 的测试,SQLite 和 PostgreSQL 16 上都跑过 |

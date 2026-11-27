@@ -28,7 +28,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 统一是这个形状,前端按 `code` 判断,`message` 是给开发者看的英文说明:
 
 ```json
-{"error": {"code": "self_approval_forbidden", "message": "PreDispatch(separation_of_duties:alice)"}}
+{"error": {"code": "self_approval_forbidden", "message": "refused: separation_of_duties:alice"}}
 ```
 
 | HTTP | `code` | 什么时候出现 |
@@ -37,7 +37,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | 403 | `self_approval_forbidden` | 发起人或配置管理员想批准 |
 | 403 | `not_requester` | 不是发起人却去回答问题 |
 | 403 | `not_allowed` | 不是发起人却去验收、取消、重开;不是接手人却去交回 |
-| 404 | `task_not_found` `approval_not_found` | 对象不存在 |
+| 404 | `task_not_found` `approval_not_found` `contract_not_found` | 对象不存在 |
 | 409 | `invalid_transition` | 当前状态不允许这个操作 |
 | 409 | `state_conflict` | 任务被别人同时改了,重新取详情后再试 |
 | 409 | `unresolved_actions` | 还有已发出但结果未定的动作,不能取消或判失败 |
@@ -45,6 +45,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | 409 | `approval_not_pending` | 这条批准已经处理过 |
 | 409 | `approval_expired` | 批准已过期,按否决处理,任务同时变化(见「批准」) |
 | 422 | `invalid_request` | 请求体不合法,或字段取值不认识 |
+| 502 | `model_unreachable` `model_error` `model_bad_response` `external_error` | 模型或行情数据出错;任务保持原样,可以再推进 |
 
 闸门拒绝一个动作不是接口错误,而是 `advance` 的结果之一(`step.kind = "denied"`,见下文)。
 

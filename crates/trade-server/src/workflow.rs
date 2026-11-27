@@ -7,10 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use trade_adapters::{FixtureMarket, PaperBroker};
 use trade_core::{
     ActionIntentRecord, ActionIntentStatus, AgentEvidenceOutput, ApprovalId, ApprovalRecord,
-    ApprovalStatus, AsOfDate, Completeness, DeliveryManifest, GateError, HandoffPackage,
+    ApprovalStatus, AsOfDate, Completeness, CostEntry, DeliveryManifest, GateError, HandoffPackage,
     IdempotencyKey, PitMarketSource, PitSecuritySnapshot, PortfolioActionPayload, PreDispatchError,
     RiskTier, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction,
     TransitionError, UsdCents, WaitMetadata, sha256_hex,
@@ -20,7 +21,7 @@ use trade_quant::{QuantSecurityResult, score_pit_universe};
 use trade_research::{
     FootnoteForensicsWorker, ManagementCapAllocWorker, MoatWorker, TargetPortfolio,
 };
-use trade_store::{CostEntry, MemoryItem, Store};
+use trade_store::{MemoryItem, Store};
 
 use crate::agent::AgentModel;
 use crate::config::Strategy;
@@ -50,6 +51,29 @@ pub struct Intake {
     pub acting_principal: String,
     pub trigger_source: String,
     pub markets: Vec<String>,
+}
+
+/// The identity the task's tools act as, separate from whoever asked.
+const ACTING_PRINCIPAL: &str = "quant_research_svc";
+
+/// A new task as the outside asks for it: the API's request body, the command line, a
+/// test. Missing values take the strategy's defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRequest {
+    pub goal: String,
+    pub as_of_date: Option<String>,
+    pub markets: Option<Vec<String>>,
+    pub portfolio_capital_usd: Option<f64>,
+    pub max_positions: Option<usize>,
+    /// May the task finish without its orders if their approval is refused?
+    #[serde(default = "yes")]
+    pub orders_optional: bool,
+    /// The trigger's own ID, for deduplication. Derived from the request when absent.
+    pub trigger_key: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// What the requester asked for, before FRAME checks it.
@@ -114,13 +138,9 @@ pub struct Harness {
     /// The task type version new tasks start with.
     pub task_type: TaskTypeConfig,
     /// The broker credential, held here and never given to workers or models.
-    pub broker_api_key: Option<String>,
+    broker_api_key: Option<String>,
     /// The model that proposes each action. Without one, ACT follows fixed rules.
     pub agent: Option<AgentModel>,
-}
-
-fn not_found(what: &str, id: &str) -> GateError {
-    GateError::Storage(format!("{what}_not_found:{id}"))
 }
 
 fn not_now(task: &TaskRecord, to: &'static str) -> GateError {
@@ -168,7 +188,7 @@ impl Harness {
         let task_type = task_types
             .into_iter()
             .find(|t| t.task_type == REBALANCE)
-            .ok_or_else(|| not_found("task_type", REBALANCE))?;
+            .ok_or_else(|| GateError::not_found("task_type", REBALANCE))?;
         if store.calibrations().await?.is_empty() {
             for (agent, confidence) in market.seed_calibrations() {
                 store.set_calibration(agent, *confidence, 0.0).await?;
@@ -215,7 +235,7 @@ impl Harness {
         self.store
             .task(task_id)
             .await?
-            .ok_or_else(|| not_found("task", task_id))
+            .ok_or_else(|| GateError::not_found("task", task_id))
     }
 
     /// Let `agent` propose every action from now on.
@@ -228,19 +248,85 @@ impl Harness {
         self.store
             .contract(task_id)
             .await?
-            .ok_or_else(|| not_found("contract", task_id))
+            .ok_or_else(|| GateError::not_found("contract", task_id))
     }
 
     pub(crate) async fn config_of(&self, task: &TaskRecord) -> Result<TaskTypeConfig, GateError> {
         self.store
             .task_type(&task.task_type, &task.config_version)
             .await?
-            .ok_or_else(|| not_found("task_type", &task.config_version))
+            .ok_or_else(|| GateError::not_found("task_type", &task.config_version))
     }
 
     // ---- ADMIT and FRAME -------------------------------------------------------------
 
     /// ADMIT: create the task, or return the one this trigger already created.
+    /// ADMIT, then FRAME when the trigger is new. The same trigger always gives the same
+    /// task, framed once. Returns the task as it is afterwards, and whether it is new.
+    pub async fn start(
+        &self,
+        requester: &str,
+        source: &str,
+        req: &TaskRequest,
+    ) -> Result<(TaskRecord, bool), GateError> {
+        let trigger_key = match &req.trigger_key {
+            Some(key) => key.clone(),
+            None => {
+                let basis = serde_json::to_string(&(requester, req))
+                    .map_err(|e| GateError::Storage(e.to_string()))?;
+                format!("{source}:{}", &sha256_hex(basis.as_bytes())[..16])
+            }
+        };
+        let (task, created) = self
+            .admit(&self.intake(&trigger_key, requester, source))
+            .await?;
+        if created {
+            self.frame(&task.task_id, &self.frame_request(req)).await?;
+        }
+        Ok((self.task(&task.task_id).await?, created))
+    }
+
+    pub fn intake(&self, trigger_key: &str, requester: &str, source: &str) -> Intake {
+        Intake {
+            trigger_key: trigger_key.into(),
+            requester_id: requester.into(),
+            acting_principal: ACTING_PRINCIPAL.into(),
+            trigger_source: source.into(),
+            markets: self.strategy.markets.clone(),
+        }
+    }
+
+    /// The request with the strategy's markets and position count filled in, ready for
+    /// FRAME. A missing date or capital stays missing: FRAME asks the requester for it.
+    pub fn frame_request(&self, r: &TaskRequest) -> FrameRequest {
+        FrameRequest {
+            goal: r.goal.clone(),
+            as_of_date: r.as_of_date.clone(),
+            markets: r
+                .markets
+                .clone()
+                .unwrap_or_else(|| self.strategy.markets.clone()),
+            portfolio_capital: r.portfolio_capital_usd.map(UsdCents::from_dollars),
+            max_positions: r
+                .max_positions
+                .unwrap_or(self.strategy.research.max_positions),
+            orders_optional: r.orders_optional,
+        }
+    }
+
+    /// A complete rebalance request for `as_of`, with the strategy's capital.
+    pub fn rebalance_request(&self, as_of: &str) -> TaskRequest {
+        TaskRequest {
+            goal: format!("Point-in-time value and quality rebalance for {as_of}"),
+            as_of_date: Some(as_of.into()),
+            markets: None,
+            portfolio_capital_usd: Some(self.strategy.research.portfolio_capital.to_dollars()),
+            max_positions: None,
+            orders_optional: true,
+            trigger_key: None,
+        }
+    }
+
     pub async fn admit(&self, intake: &Intake) -> Result<(TaskRecord, bool), GateError> {
         let id = format!("TASK-{}", &sha256_hex(intake.trigger_key.as_bytes())[..10]);
         let task = TaskRecord::new_queued(
@@ -409,7 +495,7 @@ impl Harness {
                 .store
                 .latest_draft(&task.task_id)
                 .await?
-                .ok_or_else(|| not_found("draft", &task.task_id))?;
+                .ok_or_else(|| GateError::not_found("draft", &task.task_id))?;
             let request = GateRequest {
                 task_id: task.task_id.clone(),
                 target: format!("paper_broker:{as_of}"),
@@ -430,13 +516,7 @@ impl Harness {
                 ..
             }) = &result
             {
-                let cost = CostEntry {
-                    stage: "ACT".into(),
-                    category: "broker".into(),
-                    amount: UsdCents::from_cents(1),
-                    human_minutes: 0.0,
-                    note: receipt_id.clone(),
-                };
+                let cost = CostEntry::new("ACT", "broker", UsdCents::from_cents(1), receipt_id);
                 self.store.record_cost(&task.task_id, &cost).await?;
             }
             return gated(result, ORDER_TOOL);
@@ -453,7 +533,7 @@ impl Harness {
         let snapshots = self
             .market
             .get_pit_snapshot(&contract.as_of_date, &contract.universe_markets)
-            .map_err(GateError::Storage)?;
+            .map_err(GateError::External)?;
         let quant = score_pit_universe(&snapshots, &contract.as_of_date, &self.strategy.factors);
         Ok((snapshots, quant))
     }
@@ -497,13 +577,7 @@ impl Harness {
                 outputs.push(MoatWorker.evaluate(&view, snap, q, as_of, None)?);
                 outputs.push(ManagementCapAllocWorker.evaluate(&view, snap, q, as_of, None)?);
                 outputs.push(FootnoteForensicsWorker.evaluate(&view, snap, q, as_of, None)?);
-                let cost = CostEntry {
-                    stage: "FRAME".into(),
-                    category: "specialists".into(),
-                    amount: params.worker_cost,
-                    human_minutes: 0.0,
-                    note: q.ticker.clone(),
-                };
+                let cost = CostEntry::new("FRAME", "specialists", params.worker_cost, &q.ticker);
                 self.store.record_cost(&task.task_id, &cost).await?;
             }
             decisions.push(self.strategy.committee.evaluate_security(q, outputs, &view));
@@ -555,13 +629,12 @@ impl Harness {
         };
         task.transition(TaskState::Verifying, self.store.now())?;
         self.store.save(&mut task, "verifying", "close").await?;
-        let cost = CostEntry {
-            stage: "CLOSE".into(),
-            category: "verifier".into(),
-            amount: UsdCents::from_cents(1),
-            human_minutes: 0.0,
-            note: "independent_verification".into(),
-        };
+        let cost = CostEntry::new(
+            "CLOSE",
+            "verifier",
+            UsdCents::from_cents(1),
+            "independent_verification",
+        );
         self.store.record_cost(&task.task_id, &cost).await?;
 
         let mut task = self.task(&task.task_id).await?;
@@ -611,7 +684,6 @@ impl Harness {
         task.transition(TaskState::Settling(wait), now)?;
         let manifest = DeliveryManifest {
             task_id: task.task_id.clone(),
-            final_state: task.state().clone(),
             completeness,
             criteria_results: check.criteria,
             assumptions: contract.assumptions,
@@ -621,7 +693,7 @@ impl Harness {
             draft_id: draft.as_ref().map(|d| d.draft_id.clone()),
             weights: draft.map(|d| d.weights).unwrap_or_default(),
         };
-        self.store.deliver(&manifest, &mut task).await?;
+        self.store.deliver(&manifest, &mut task, "verifier").await?;
         Ok(Some(Step::Delivered(manifest)))
     }
 
@@ -795,7 +867,14 @@ impl Harness {
         };
         task.transition(next, self.store.now())?;
         self.store
-            .decide_approval(&approval.approval_id, status, approver_id, note, task)
+            .decide_approval(
+                &approval.approval_id,
+                status,
+                approver_id,
+                note,
+                task,
+                approver_id.unwrap_or("sweeper"),
+            )
             .await
     }
 
@@ -817,11 +896,8 @@ impl Harness {
             .await?;
         if review_minutes > 0.0 {
             let cost = CostEntry {
-                stage: "CLOSE".into(),
-                category: "human_review".into(),
-                amount: UsdCents::ZERO,
                 human_minutes: review_minutes,
-                note: confirmer_id.into(),
+                ..CostEntry::new("CLOSE", "human_review", UsdCents::ZERO, confirmer_id)
             };
             self.store.record_cost(task_id, &cost).await?;
         }
@@ -951,9 +1027,6 @@ impl Harness {
                 .await?
                 .map(|d| d.weights)
                 .unwrap_or_default(),
-            open_questions: vec![reason.into()],
-            assigned_human_owner: Some(owner.clone()),
-            accepted_by_human: false,
         };
         let now = self.store.now();
         let wait = WaitMetadata::new(
@@ -962,7 +1035,7 @@ impl Harness {
             TimeoutAction::Escalate,
         )?;
         task.transition(TaskState::HandedOff(wait), now)?;
-        self.store.hand_off(&package, &mut task).await?;
+        self.store.hand_off(&package, &mut task, "workflow").await?;
         Ok(Step::HandedOff(owner))
     }
 

@@ -3,17 +3,16 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use sqlx::AnyConnection;
-use sqlx::FromRow;
+use sqlx::{Any, AnyConnection, FromRow, Transaction};
 use trade_core::{
     DeliveryManifest, GateError, HandoffPackage, IdempotencyKey, PreDispatchError, TaskContract,
     TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, UsdCents, WaitMetadata,
 };
 
-use crate::{Change, Store, count, db, from_json, not_found, to_json};
+use crate::{Change, Store, all, count, db, from_json, to_json};
 
 /// Statuses of an action that was sent and not yet settled.
-pub(crate) const UNSETTLED: &str = "('DISPATCHED', 'EXECUTED', 'UNKNOWN')";
+pub(crate) const UNSETTLED: &str = "('DISPATCHED', 'UNKNOWN')";
 
 /// One line of a task's audit trail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
@@ -90,10 +89,6 @@ impl TryFrom<TaskRow> for TaskRecord {
     }
 }
 
-fn tasks_from(rows: Vec<TaskRow>) -> Result<Vec<TaskRecord>, GateError> {
-    rows.into_iter().map(TaskRecord::try_from).collect()
-}
-
 pub(crate) async fn task_in(
     conn: &mut AnyConnection,
     task_id: &TaskId,
@@ -142,6 +137,19 @@ pub(crate) async fn unsettled_action_in(
 
 /// Save `task` if the stored version is still `task.version()`, and log the change, in
 /// the caller's transaction. Returns the new version.
+/// Save `task` with `change` in `tx`, commit, and give `task` its new version.
+pub(crate) async fn commit_task(
+    mut tx: Transaction<'static, Any>,
+    task: &mut TaskRecord,
+    change: &Change<'_>,
+    now: i64,
+) -> Result<(), GateError> {
+    let version = save_in(&mut tx, task, change, now).await?;
+    tx.commit().await.map_err(db)?;
+    task.set_persisted_version(version);
+    Ok(())
+}
+
 pub(crate) async fn save_in(
     conn: &mut AnyConnection,
     task: &TaskRecord,
@@ -163,7 +171,7 @@ pub(crate) async fn save_in(
     .fetch_optional(&mut *conn)
     .await
     .map_err(db)?
-    .ok_or_else(|| not_found("task", &task.task_id))?;
+    .ok_or_else(|| GateError::not_found("task", &task.task_id))?;
     if stored_version != task.version() {
         return Err(conflict());
     }
@@ -396,7 +404,7 @@ impl Store {
         .fetch_one(&self.pool)
         .await
         .map_err(db)?;
-        Ok((tasks_from(rows)?, total))
+        Ok((all(rows)?, total))
     }
 
     /// How many tasks are in each state, and approvals in each status.
@@ -426,11 +434,8 @@ impl Store {
         actor: &str,
     ) -> Result<(), GateError> {
         let now = self.now();
-        let mut tx = self.begin().await?;
-        let version = save_in(&mut tx, task, &Change::new("update", actor, reason), now).await?;
-        tx.commit().await.map_err(db)?;
-        task.set_persisted_version(version);
-        Ok(())
+        let tx = self.begin().await?;
+        commit_task(tx, task, &Change::new("update", actor, reason), now).await
     }
 
     /// Append a line to the task's session log, such as the model's reply or what it was
@@ -468,7 +473,7 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
-        tasks_from(rows)
+        all(rows)
     }
 
     pub async fn save_contract(&self, contract: &TaskContract) -> Result<(), GateError> {
@@ -499,6 +504,7 @@ impl Store {
         &self,
         manifest: &DeliveryManifest,
         task: &mut TaskRecord,
+        actor: &str,
     ) -> Result<(), GateError> {
         let now = self.now();
         let mut tx = self.begin().await?;
@@ -516,11 +522,8 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        let change = Change::new("delivered", "workflow", manifest.completeness.as_str());
-        let version = save_in(&mut tx, task, &change, now).await?;
-        tx.commit().await.map_err(db)?;
-        task.set_persisted_version(version);
-        Ok(())
+        let change = Change::new("delivered", actor, manifest.completeness.as_str());
+        commit_task(tx, task, &change, now).await
     }
 
     pub async fn delivery(&self, task_id: &TaskId) -> Result<Option<DeliveryManifest>, GateError> {
@@ -536,6 +539,7 @@ impl Store {
         &self,
         package: &HandoffPackage,
         task: &mut TaskRecord,
+        actor: &str,
     ) -> Result<(), GateError> {
         let now = self.now();
         let owner = task.state().wait_meta().map_or("", |w| w.owner_id.as_str());
@@ -554,11 +558,8 @@ impl Store {
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-        let change = Change::new("handed_off", "workflow", &package.trigger_reason);
-        let version = save_in(&mut tx, task, &change, now).await?;
-        tx.commit().await.map_err(db)?;
-        task.set_persisted_version(version);
-        Ok(())
+        let change = Change::new("handed_off", actor, &package.trigger_reason);
+        commit_task(tx, task, &change, now).await
     }
 
     pub async fn handoff(&self, task_id: &TaskId) -> Result<Option<HandoffPackage>, GateError> {

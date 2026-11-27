@@ -116,7 +116,6 @@ impl AsOfDate {
 pub struct WeightBps(u16);
 
 impl WeightBps {
-    pub const ZERO: Self = Self(0);
     pub const MAX: u16 = 10_000;
 
     pub fn new(bps: u16) -> Result<Self, SchemaError> {
@@ -173,10 +172,6 @@ impl UsdCents {
 
     pub fn to_dollars(self) -> f64 {
         (self.0 as f64) / 100.0
-    }
-
-    pub fn saturating_add(self, rhs: Self) -> Self {
-        Self(self.0.saturating_add(rhs.0))
     }
 }
 

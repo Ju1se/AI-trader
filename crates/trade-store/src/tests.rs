@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use sqlx::Connection;
 use trade_core::{
     ActionIntentStatus, ApprovalStatus, AsOfDate, AutonomyLevel, BudgetLimits, Completeness,
-    DeliveryManifest, ExecError, GateError, HandoffPackage, IdempotencyKey, PreDispatchError,
-    RiskTier, ShapeLevel, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, UsdCents,
-    WaitMetadata,
+    CostEntry, DeliveryManifest, ExecError, GateError, HandoffPackage, IdempotencyKey,
+    PreDispatchError, RiskTier, ShapeLevel, TaskId, TaskRecord, TaskState, TaskTypeConfig,
+    TimeoutAction, UsdCents, WaitMetadata,
 };
 use trade_gate::{
     DispatchResult, GateLedger, GateOutcome, GateRequest, Tool, VerifiedGateTicket, run,
@@ -148,6 +148,7 @@ async fn approved_order(store: &Store, task: &TaskRecord, tool: &Order) -> GateR
             Some("bob"),
             None,
             &mut task,
+            "bob",
         )
         .await
         .unwrap();
@@ -288,6 +289,7 @@ async fn a_rejection_after_the_gate_read_wins() {
             Some("bob"),
             Some("changed my mind"),
             &mut fresh,
+            "bob",
         )
         .await
         .unwrap();
@@ -496,7 +498,6 @@ async fn results_deliveries_and_handoffs_round_trip() {
 
     let manifest = DeliveryManifest {
         task_id: task.task_id.clone(),
-        final_state: TaskState::Verifying,
         completeness: Completeness::Partial,
         criteria_results: BTreeMap::from([("weights_delivered".to_string(), true)]),
         assumptions: vec![],
@@ -513,7 +514,7 @@ async fn results_deliveries_and_handoffs_round_trip() {
         now,
     )
     .unwrap();
-    store.deliver(&manifest, &mut task).await.unwrap();
+    store.deliver(&manifest, &mut task, "test").await.unwrap();
     let stored = store.delivery(&task.task_id).await.unwrap().unwrap();
     assert_eq!(stored.gaps, manifest.gaps);
 
@@ -525,9 +526,6 @@ async fn results_deliveries_and_handoffs_round_trip() {
         completed_actions: vec![],
         pending_actions: vec![],
         partial_weights: BTreeMap::new(),
-        open_questions: vec!["why".into()],
-        assigned_human_owner: Some("carol".into()),
-        accepted_by_human: false,
     };
     task.transition(
         TaskState::HandedOff(
@@ -536,15 +534,15 @@ async fn results_deliveries_and_handoffs_round_trip() {
         now,
     )
     .unwrap();
-    store.hand_off(&package, &mut task).await.unwrap();
+    store.hand_off(&package, &mut task, "test").await.unwrap();
     assert_eq!(
         store
             .handoff(&task.task_id)
             .await
             .unwrap()
             .unwrap()
-            .open_questions,
-        ["why"]
+            .trigger_reason,
+        "settlement_disputed"
     );
     assert_eq!(reload(&store, &task).await.state().code(), "HANDED_OFF");
 }

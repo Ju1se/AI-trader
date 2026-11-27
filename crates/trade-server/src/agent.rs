@@ -13,12 +13,11 @@ use serde::Deserialize;
 use serde_json::Value;
 use trade_adapters::{ChatMessage, ChatModel};
 use trade_core::{
-    ApprovalRecord, ApprovalStatus, GateError, IdempotencyKey, PortfolioActionPayload,
+    ApprovalRecord, ApprovalStatus, CostEntry, GateError, IdempotencyKey, PortfolioActionPayload,
     PreDispatchError, ReadOnlyPitView, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig,
     UsdCents, WeightBps,
 };
 use trade_gate::{GateLedger, GateOutcome, GateRequest, run, used_up_limit};
-use trade_store::CostEntry;
 
 use crate::tools::{DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadRequest, is_read};
 use crate::workflow::{Harness, Step};
@@ -198,20 +197,15 @@ impl Harness {
             .model
             .complete_json(&messages)
             .await
-            .map_err(GateError::Storage)?;
+            .map_err(GateError::External)?;
         let id = &task.task_id;
-        let usage = CostEntry {
-            stage: "ACT".into(),
-            category: "model".into(),
-            amount: UsdCents::ZERO,
-            human_minutes: 0.0,
-            note: format!(
-                "{}: {} prompt and {} completion tokens",
-                agent.model.name(),
-                reply.prompt_tokens,
-                reply.completion_tokens
-            ),
-        };
+        let note = format!(
+            "{}: {} prompt and {} completion tokens",
+            agent.model.name(),
+            reply.prompt_tokens,
+            reply.completion_tokens
+        );
+        let usage = CostEntry::new("ACT", "model", UsdCents::ZERO, note);
         self.store.record_cost(id, &usage).await?;
         self.store
             .note(id, REPLY, agent.model.name(), &reply.content, false)
@@ -421,13 +415,7 @@ impl Harness {
             ..
         }) = result
         {
-            let cost = CostEntry {
-                stage: "ACT".into(),
-                category: "broker".into(),
-                amount: UsdCents::from_cents(1),
-                human_minutes: 0.0,
-                note: receipt_id.clone(),
-            };
+            let cost = CostEntry::new("ACT", "broker", UsdCents::from_cents(1), receipt_id);
             self.store.record_cost(task_id, &cost).await?;
         }
         Ok(())

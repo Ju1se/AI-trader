@@ -387,14 +387,10 @@ mod tests {
     use trade_quant::{FactorParams, score_pit_universe};
 
     struct MockView {
-        markets: Vec<String>,
         filings: Vec<UntrustedFiling>,
     }
 
     impl ReadOnlyPitView for MockView {
-        fn authorized_markets(&self) -> &[String] {
-            &self.markets
-        }
         fn get_pit_filings(
             &self,
             ticker: &str,
@@ -479,7 +475,6 @@ mod tests {
         );
 
         let view = MockView {
-            markets: vec!["US".into()],
             filings: vec![injected],
         };
         let moat = MoatWorker.evaluate(&view, &snap, quant, &dt, None).unwrap();

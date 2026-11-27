@@ -5,21 +5,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use trade_core::{
-    AsOfDate, CommitteeDecision, GateError, PortfolioActionPayload, TaskId, UsdCents, WeightBps,
+    AsOfDate, CommitteeDecision, CostEntry, GateError, PortfolioActionPayload, StoredDraft, TaskId,
+    UsdCents,
 };
 use trade_gate::VerifiedGateTicket;
 
 use sqlx::AnyConnection;
 
 use crate::{Change, Fact, Store, db, from_json, new_id, to_json};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredDraft {
-    pub draft_id: String,
-    pub task_id: TaskId,
-    pub as_of_date: AsOfDate,
-    pub weights: BTreeMap<String, WeightBps>,
-}
 
 #[derive(FromRow)]
 struct DraftRow {
@@ -40,20 +33,6 @@ impl TryFrom<DraftRow> for StoredDraft {
             weights: from_json(&r.weights_json)?,
         })
     }
-}
-
-/// One cost entry (Diagram 8 COST_ENTRY).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CostEntry {
-    /// PREPARE, ADMIT, FRAME, ACT or CLOSE.
-    pub stage: String,
-    /// For example `model`, `tool` or `review`.
-    pub category: String,
-    /// API and tool spend. It counts against the task's spend limit.
-    pub amount: UsdCents,
-    /// Time people spent. Priced in unit economics, not in the task's spend limit.
-    pub human_minutes: f64,
-    pub note: String,
 }
 
 /// Diagram 6 CALCULATE: what one successful task costs, all in.
@@ -202,7 +181,7 @@ impl Store {
     /// transaction, so the spend limit always sees it.
     pub async fn record_cost(&self, task_id: &TaskId, cost: &CostEntry) -> Result<(), GateError> {
         let cost_id = new_id("COST");
-        let change = Change::new("cost", "workflow", &cost.category).about(&cost_id);
+        let change = Change::new("cost", &cost.category, &cost.stage).about(&cost_id);
         let fact = Fact::Cost {
             cost_id: &cost_id,
             cost,

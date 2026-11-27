@@ -21,10 +21,12 @@ use serde::de::DeserializeOwned;
 use sqlx::AnyConnection;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{Any, AnyPool, Transaction};
-use trade_core::{GateError, IdempotencyKey, TaskId, TaskRecord, TaskState, UsdCents, sha256_hex};
+use trade_core::{
+    CostEntry, GateError, IdempotencyKey, TaskId, TaskRecord, TaskState, UsdCents, sha256_hex,
+};
 use trade_gate::DispatchResult;
 
-pub use results::{CostEntry, MemoryItem, StoredDraft, UnitEconomics};
+pub use results::{MemoryItem, UnitEconomics};
 pub use tasks::TaskEvent;
 
 /// How often a write that only records facts is retried after a version conflict.
@@ -112,7 +114,7 @@ impl Store {
             let mut tx = self.begin().await?;
             let mut task = tasks::task_in(&mut tx, task_id)
                 .await?
-                .ok_or_else(|| not_found("task", task_id))?;
+                .ok_or_else(|| GateError::not_found("task", task_id))?;
             fact.apply(&mut tx, &mut task, now).await?;
             match tasks::save_in(&mut tx, &task, &change, now).await {
                 Err(GateError::Conflict(_)) => continue,
@@ -233,8 +235,9 @@ fn db(e: sqlx::Error) -> GateError {
     GateError::Storage(e.to_string())
 }
 
-fn not_found(what: &str, id: &str) -> GateError {
-    GateError::Storage(format!("{what}_not_found:{id}"))
+/// Rows read from the database, as domain records.
+fn all<R, T: TryFrom<R, Error = GateError>>(rows: Vec<R>) -> Result<Vec<T>, GateError> {
+    rows.into_iter().map(T::try_from).collect()
 }
 
 fn to_json<T: Serialize>(value: &T) -> Result<String, GateError> {

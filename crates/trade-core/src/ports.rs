@@ -1,5 +1,5 @@
-//! Read-only data access that research and quant code needs. The store implements these
-//! traits, so neither research nor quant ever touches the database.
+//! Read-only data access that research and quant code needs. The market adapter implements
+//! these traits, so neither research nor quant reads files or a database itself.
 
 use std::collections::BTreeMap;
 
@@ -8,7 +8,6 @@ use crate::types::{AsOfDate, UntrustedFiling};
 
 /// What a specialist worker may read: filings in its authorised markets and its calibration.
 pub trait ReadOnlyPitView {
-    fn authorized_markets(&self) -> &[String];
     fn get_pit_filings(
         &self,
         ticker: &str,

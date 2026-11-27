@@ -3,14 +3,12 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
-
 use crate::state::TransitionError;
 use crate::types::SchemaError;
 
 /// Failure occurring strictly BEFORE an external/consequential request is dispatched.
 /// Safe to deny without putting the task into `OUTCOME_UNKNOWN`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreDispatchError {
     ToolNotConfigured(String),
     R4PermanentlyProhibited(String),
@@ -85,8 +83,9 @@ impl std::error::Error for PreDispatchError {}
 pub enum GateError {
     /// Failed before dispatching the action; task does NOT enter `OUTCOME_UNKNOWN`.
     PreDispatch(PreDispatchError),
-    /// Failed AFTER dispatching the action (timeout, transport drop, broker error, or read-back failure).
-    /// Task is unconditionally transitioned to `OUTCOME_UNKNOWN` and frozen until reconciled!
+    /// Failed after the request left (timeout, dropped connection, broker error, or a
+    /// read-back that does not match). The task moves to `OUTCOME_UNKNOWN` and is frozen
+    /// until reconciled, unless a person has already taken it over.
     PostDispatchUnknown {
         idempotency_key: String,
         detail: String,
@@ -94,7 +93,11 @@ pub enum GateError {
     /// The tool failed before its request left; the action is marked failed and may be
     /// retried under the same idempotency key. The task stays in RUNNING.
     NotSent(String),
-    /// Storage or schema integrity error.
+    /// A task, contract, approval or other record that does not exist.
+    NotFound { what: &'static str, id: String },
+    /// A system outside the backend failed: the model or the market data.
+    External(String),
+    /// Storage or stored-data integrity error.
     Storage(String),
     /// Another writer changed the task first; reload and decide again.
     Conflict(String),
@@ -107,19 +110,27 @@ pub enum GateError {
 impl fmt::Display for GateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PreDispatch(e) => write!(f, "PreDispatch({e})"),
+            Self::PreDispatch(e) => write!(f, "refused: {e}"),
             Self::PostDispatchUnknown {
                 idempotency_key,
                 detail,
-            } => write!(
-                f,
-                "PostDispatchUnknown(idempotency_key={idempotency_key}, detail={detail})"
-            ),
-            Self::NotSent(s) => write!(f, "NotSent({s})"),
-            Self::Storage(s) => write!(f, "Storage({s})"),
-            Self::Conflict(s) => write!(f, "Conflict({s})"),
-            Self::StateTransition(e) => write!(f, "StateTransition({e})"),
-            Self::Schema(e) => write!(f, "Schema({e})"),
+            } => write!(f, "outcome unknown for {idempotency_key}: {detail}"),
+            Self::NotSent(s) => write!(f, "not sent: {s}"),
+            Self::NotFound { what, id } => write!(f, "{what} {id} not found"),
+            Self::External(s) => write!(f, "external system failed: {s}"),
+            Self::Storage(s) => write!(f, "storage error: {s}"),
+            Self::Conflict(s) => write!(f, "conflict: {s}"),
+            Self::StateTransition(e) => write!(f, "{e}"),
+            Self::Schema(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl GateError {
+    pub fn not_found(what: &'static str, id: impl ToString) -> Self {
+        Self::NotFound {
+            what,
+            id: id.to_string(),
         }
     }
 }

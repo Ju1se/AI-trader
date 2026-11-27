@@ -1,7 +1,7 @@
 //! Strongly-validated contracts for Agent 1-7 governance (Diagrams 3a, 3b, 4a, 4b).
 //! - Unconfigured tools are rejected (`lookup_tool_risk -> None`).
 //! - `R4` means permanently prohibited (`永远拒绝`); order submission is `R3`.
-//! - External callers CANNOT construct approval tokens; `ActionGate` only accepts `approval_id`.
+//! - Nothing outside the gate can make an approval; requests name it by `approval_id`.
 //! - Caller action payloads NEVER carry veto lists (`vetoed_tickers`).
 
 use std::collections::BTreeMap;
@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ApprovalId, IdempotencyKey, TaskId};
-use crate::state::TaskState;
 use crate::types::{
     AsOfDate, FilingDate, PeriodEndDate, SchemaError, UsdCents, WeightBps, require_non_empty,
 };
@@ -75,17 +74,6 @@ impl RiskTier {
             Self::R2 => "R2",
             Self::R3 => "R3",
             Self::R4 => "R4",
-        }
-    }
-
-    pub fn from_db_str(s: &str) -> Result<Self, SchemaError> {
-        match s {
-            "R0" => Ok(Self::R0),
-            "R1" => Ok(Self::R1),
-            "R2" => Ok(Self::R2),
-            "R3" => Ok(Self::R3),
-            "R4" => Ok(Self::R4),
-            other => Err(SchemaError(format!("unknown_risk_tier:{other}"))),
         }
     }
 }
@@ -374,9 +362,7 @@ pub struct ApprovalRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ActionIntentStatus {
-    Planned,
     Dispatched,
-    Executed,
     Verified,
     Unknown,
     Failed,
@@ -385,9 +371,7 @@ pub enum ActionIntentStatus {
 impl ActionIntentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Planned => "PLANNED",
             Self::Dispatched => "DISPATCHED",
-            Self::Executed => "EXECUTED",
             Self::Verified => "VERIFIED",
             Self::Unknown => "UNKNOWN",
             Self::Failed => "FAILED",
@@ -396,9 +380,7 @@ impl ActionIntentStatus {
 
     pub fn from_db_str(s: &str) -> Result<Self, SchemaError> {
         match s {
-            "PLANNED" => Ok(Self::Planned),
             "DISPATCHED" => Ok(Self::Dispatched),
-            "EXECUTED" => Ok(Self::Executed),
             "VERIFIED" => Ok(Self::Verified),
             "UNKNOWN" => Ok(Self::Unknown),
             "FAILED" => Ok(Self::Failed),
@@ -425,7 +407,6 @@ pub struct ActionIntentRecord {
 pub enum Completeness {
     Complete,
     Partial,
-    Blocked,
 }
 
 impl Completeness {
@@ -433,7 +414,6 @@ impl Completeness {
         match self {
             Self::Complete => "COMPLETE",
             Self::Partial => "PARTIAL",
-            Self::Blocked => "BLOCKED",
         }
     }
 }
@@ -441,7 +421,6 @@ impl Completeness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryManifest {
     pub task_id: TaskId,
-    pub final_state: TaskState,
     pub completeness: Completeness,
     pub criteria_results: BTreeMap<String, bool>,
     pub assumptions: Vec<String>,
@@ -450,6 +429,41 @@ pub struct DeliveryManifest {
     pub next_owner: String,
     pub draft_id: Option<String>,
     pub weights: BTreeMap<String, WeightBps>,
+}
+
+/// The rebalance draft as written, which orders must match exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredDraft {
+    pub draft_id: String,
+    pub task_id: TaskId,
+    pub as_of_date: AsOfDate,
+    pub weights: BTreeMap<String, WeightBps>,
+}
+
+/// One cost entry (Diagram 8 COST_ENTRY).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostEntry {
+    /// PREPARE, ADMIT, FRAME, ACT or CLOSE.
+    pub stage: String,
+    /// For example `model`, `broker` or `human_review`.
+    pub category: String,
+    /// API and tool spend. It counts against the task's spend limit.
+    pub amount: UsdCents,
+    /// Time people spent. Priced in unit economics, not in the task's spend limit.
+    pub human_minutes: f64,
+    pub note: String,
+}
+
+impl CostEntry {
+    pub fn new(stage: &str, category: &str, amount: UsdCents, note: impl Into<String>) -> Self {
+        Self {
+            stage: stage.into(),
+            category: category.into(),
+            amount,
+            human_minutes: 0.0,
+            note: note.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,9 +475,6 @@ pub struct HandoffPackage {
     pub completed_actions: Vec<String>,
     pub pending_actions: Vec<String>,
     pub partial_weights: BTreeMap<String, WeightBps>,
-    pub open_questions: Vec<String>,
-    pub assigned_human_owner: Option<String>,
-    pub accepted_by_human: bool,
 }
 
 /// Everything public about one security on a given date. Forward returns are deliberately

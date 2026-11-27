@@ -8,8 +8,9 @@ use trade_core::{
 };
 use trade_gate::{DispatchResult, GateContext, GateLedger, NewApproval};
 
+use crate::tasks::commit_task;
 use crate::tasks::{UNSETTLED, save_in, task_in, task_type_in, unsettled_action_in};
-use crate::{Change, Fact, Store, db, new_id, not_found};
+use crate::{Change, Fact, Store, all, db, new_id};
 
 #[derive(FromRow)]
 struct ApprovalRow {
@@ -103,10 +104,6 @@ async fn action_in(
         .transpose()
 }
 
-fn actions_from(rows: Vec<ActionRow>) -> Result<Vec<ActionIntentRecord>, GateError> {
-    rows.into_iter().map(ActionIntentRecord::try_from).collect()
-}
-
 /// Record how a sent action ended, if it is still in one of the `from` statuses. An action
 /// that never left gives back the approval it used, since that approval was not spent.
 pub(crate) async fn settle_action_in(
@@ -175,10 +172,10 @@ impl GateLedger for Store {
         let mut conn = self.pool.acquire().await.map_err(db)?;
         let task = task_in(&mut conn, task_id)
             .await?
-            .ok_or_else(|| not_found("task", task_id))?;
+            .ok_or_else(|| GateError::not_found("task", task_id))?;
         let config = task_type_in(&mut conn, &task.task_type, &task.config_version)
             .await?
-            .ok_or_else(|| not_found("task_type", &task.config_version))?;
+            .ok_or_else(|| GateError::not_found("task_type", &task.config_version))?;
         let approval = match approval_id {
             Some(id) => approval_in(&mut conn, id).await?,
             None => None,
@@ -278,7 +275,7 @@ impl GateLedger for Store {
              ON CONFLICT (idempotency_key) DO UPDATE SET status = 'DISPATCHED',
                  approval_id = EXCLUDED.approval_id, detail = NULL,
                  updated_epoch_s = EXCLUDED.updated_epoch_s
-             WHERE actions.status IN ('FAILED', 'PLANNED')
+             WHERE actions.status = 'FAILED'
                AND actions.payload_hash = EXCLUDED.payload_hash",
         )
         .bind(key)
@@ -332,10 +329,8 @@ impl Store {
         .bind(status.map(ApprovalStatus::as_str))
         .fetch_all(&self.pool)
         .await
-        .map_err(db)?
-        .into_iter()
-        .map(ApprovalRecord::try_from)
-        .collect()
+        .map_err(db)
+        .and_then(all)
     }
 
     /// A task's approvals, newest first.
@@ -346,10 +341,8 @@ impl Store {
         .bind(task_id.as_str())
         .fetch_all(&self.pool)
         .await
-        .map_err(db)?
-        .into_iter()
-        .map(ApprovalRecord::try_from)
-        .collect()
+        .map_err(db)
+        .and_then(all)
     }
 
     /// Record a decision and save `task` with its next state, in one transaction. A
@@ -363,6 +356,7 @@ impl Store {
         approver_id: Option<&str>,
         note: Option<&str>,
         task: &mut TaskRecord,
+        actor: &str,
     ) -> Result<(), GateError> {
         let now = self.now();
         let mut tx = self.begin().await?;
@@ -387,12 +381,8 @@ impl Store {
                 "approval {id} cannot take this decision"
             )));
         }
-        let actor = approver_id.unwrap_or("sweeper");
         let change = Change::new("approval_decided", actor, status.as_str()).about(id);
-        let version = save_in(&mut tx, task, &change, now).await?;
-        tx.commit().await.map_err(db)?;
-        task.set_persisted_version(version);
-        Ok(())
+        commit_task(tx, task, &change, now).await
     }
 
     pub async fn actions(&self, task_id: &TaskId) -> Result<Vec<ActionIntentRecord>, GateError> {
@@ -403,7 +393,7 @@ impl Store {
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
-        actions_from(rows)
+        all(rows)
     }
 
     /// Actions sent but not settled, across all tasks: what recovery must reconcile.
@@ -415,7 +405,7 @@ impl Store {
             .fetch_all(&self.pool)
             .await
             .map_err(db)?;
-        actions_from(rows)
+        all(rows)
     }
 
     /// Settle an action after checking the target system, and save `task` with its next
@@ -431,9 +421,6 @@ impl Store {
         let mut tx = self.begin().await?;
         settle_action_in(&mut tx, key, result, UNSETTLED, now).await?;
         let change = Change::new("reconciled", actor, result_name(result)).about(key);
-        let version = save_in(&mut tx, task, &change, now).await?;
-        tx.commit().await.map_err(db)?;
-        task.set_persisted_version(version);
-        Ok(())
+        commit_task(tx, task, &change, now).await
     }
 }

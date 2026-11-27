@@ -183,7 +183,7 @@ impl FixtureMarket {
 }
 
 /// One snapshot row: the security's name and delisting, the financials' market, industry
-/// and figures, and the price, as in the store's old point-in-time query.
+/// and figures, and the price as of that date.
 fn snapshot_of(s: &Security, f: &Financial, p: &Price) -> Result<PitSecuritySnapshot, String> {
     let mut row = s.rest.clone();
     row.extend(f.rest.clone());
@@ -236,10 +236,6 @@ pub struct ScopedView {
 }
 
 impl ReadOnlyPitView for ScopedView {
-    fn authorized_markets(&self) -> &[String] {
-        &self.markets
-    }
-
     fn get_pit_filings(
         &self,
         ticker: &str,

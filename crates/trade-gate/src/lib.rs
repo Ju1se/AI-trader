@@ -307,7 +307,7 @@ fn evaluate<T: Tool>(
                     payload_hash,
                 });
             }
-            (ActionIntentStatus::Failed | ActionIntentStatus::Planned, _) => {}
+            (ActionIntentStatus::Failed, _) => {}
             _ => return Err(Stop(E::UnreconciledIntentExists(key()))),
         }
     }

@@ -657,9 +657,7 @@ impl GateLedger for MockLedger {
         let unresolved = db.intents.values().find(|i| {
             matches!(
                 i.status,
-                ActionIntentStatus::Dispatched
-                    | ActionIntentStatus::Executed
-                    | ActionIntentStatus::Unknown
+                ActionIntentStatus::Dispatched | ActionIntentStatus::Unknown
             )
         });
         let ctx = GateContext {

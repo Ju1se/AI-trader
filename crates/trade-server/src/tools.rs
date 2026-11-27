@@ -12,12 +12,12 @@ use serde::Serialize;
 use trade_adapters::{BrokerOrderReceipt, FixtureMarket, PaperBroker};
 use trade_core::{
     ActionIntentRecord, ExecError, GateError, IdempotencyKey, PitMarketSource, PitSecuritySnapshot,
-    PortfolioActionPayload, PreDispatchError, RiskTier, TaskContract, TaskId, TaskRecord, UsdCents,
-    WeightBps,
+    PortfolioActionPayload, PreDispatchError, RiskTier, StoredDraft, TaskContract, TaskId,
+    TaskRecord, UsdCents, WeightBps,
 };
 use trade_gate::{DispatchResult, Tool, VerifiedGateTicket};
 use trade_research::InvestmentCommittee;
-use trade_store::{Store, StoredDraft};
+use trade_store::Store;
 
 pub const DRAFT_TOOL: &str = "create_rebalance_draft";
 pub const ORDER_TOOL: &str = "submit_paper_orders";
@@ -103,10 +103,10 @@ async fn load_portfolio_facts(
     let contract = store
         .contract(&task.task_id)
         .await?
-        .ok_or_else(|| GateError::Storage(format!("contract_not_found:{}", task.task_id)))?;
+        .ok_or_else(|| GateError::not_found("contract", &task.task_id))?;
     let universe = market
         .get_pit_snapshot(&contract.as_of_date, &contract.universe_markets)
-        .map_err(GateError::Storage)?;
+        .map_err(GateError::External)?;
     let draft = match draft_id {
         Some(id) => store.draft(id).await?,
         None => None,

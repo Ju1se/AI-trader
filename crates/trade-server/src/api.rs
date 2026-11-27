@@ -24,11 +24,11 @@ use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use trade_adapters::BrokerFault;
 use trade_core::{
-    ApprovalId, ApprovalRecord, ApprovalStatus, GateError, PreDispatchError, RiskTier, TaskId,
-    TaskRecord, TaskState, UsdCents, sha256_hex,
+    ActionIntentRecord, ApprovalId, ApprovalRecord, ApprovalStatus, GateError, PreDispatchError,
+    RiskTier, TaskId, TaskRecord, TaskState, TaskTypeConfig,
 };
 
-use crate::workflow::{FrameRequest, Framing, Harness, Intake, Step};
+use crate::workflow::{Framing, Harness, Step, TaskRequest};
 
 /// Human time in unit economics, per hour.
 const HUMAN_RATE_CENTS: i64 = 12_000;
@@ -90,10 +90,10 @@ impl From<GateError> for ApiError {
             GateError::StateTransition(_) => (S::CONFLICT, "invalid_transition".into()),
             GateError::Conflict(_) => (S::CONFLICT, "state_conflict".into()),
             GateError::Schema(_) => (S::UNPROCESSABLE_ENTITY, "invalid_request".into()),
-            GateError::Storage(s) if s.contains("_not_found:") => (
-                S::NOT_FOUND,
-                s.split(':').next().unwrap_or("not_found").to_string(),
-            ),
+            GateError::NotFound { what, .. } => (S::NOT_FOUND, format!("{what}_not_found")),
+            // The model or the market data: its own code when it gives one, such as
+            // `model_unreachable`.
+            GateError::External(s) => (S::BAD_GATEWAY, external_code(s)),
             _ => (S::INTERNAL_SERVER_ERROR, "internal".into()),
         };
         Self {
@@ -105,6 +105,13 @@ impl From<GateError> for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
+
+fn external_code(detail: &str) -> String {
+    match detail.split_once(':') {
+        Some((code, _)) if code.chars().all(|c| c.is_ascii_lowercase() || c == '_') => code.into(),
+        _ => "external_error".into(),
+    }
+}
 
 fn forbidden(code: &str, message: &str) -> ApiError {
     ApiError::new(StatusCode::FORBIDDEN, code, message)
@@ -354,7 +361,8 @@ fn approval_view(h: &Harness, a: &ApprovalRecord) -> Value {
     })
 }
 
-fn step_view(step: &Step) -> Value {
+/// Where `advance` stopped, as the API and the command line report it.
+pub fn step_view(step: &Step) -> Value {
     match step {
         Step::NeedsApproval { approval_id, tool } => {
             json!({"kind": "needs_approval", "approval_id": approval_id, "tool": tool})
@@ -368,6 +376,39 @@ fn step_view(step: &Step) -> Value {
         Step::HandedOff(owner) => json!({"kind": "handed_off", "owner": owner}),
         Step::Waiting(state) => json!({"kind": "waiting", "state": state}),
     }
+}
+
+fn action_view(a: &ActionIntentRecord) -> Value {
+    json!({
+        "idempotency_key": a.idempotency_key,
+        "task_id": a.task_id,
+        "tool_name": a.tool_name,
+        "target": a.target,
+        "args": serde_json::from_str::<Value>(&a.args_json).unwrap_or(Value::Null),
+        "payload_hash": a.payload_hash,
+        "status": a.status.as_str(),
+        "backend_receipt_id": a.backend_receipt_id,
+        "readback_verified": a.readback_verified,
+    })
+}
+
+fn task_type_view(t: &TaskTypeConfig) -> Value {
+    let tools: BTreeMap<&str, &str> = t
+        .allowed_tools
+        .iter()
+        .map(|(tool, tier)| (tool.as_str(), tier.as_str()))
+        .collect();
+    json!({
+        "task_type": t.task_type,
+        "version": t.version,
+        "shape_level": t.shape_level.as_str(),
+        "shape_rationale": t.shape_rationale,
+        "autonomy_level": t.autonomy_level.as_str(),
+        "allowed_tools": tools,
+        "budget_limits": t.budget_limits,
+        "done_criteria": t.done_criteria,
+        "waits": t.waits,
+    })
 }
 
 async fn detail(h: &Harness, id: &TaskId) -> ApiResult<Value> {
@@ -409,39 +450,6 @@ where
 }
 
 // ---- Requests --------------------------------------------------------------------------------
-
-/// A new task, or the corrected request that answers FRAME's questions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskRequest {
-    pub goal: String,
-    pub as_of_date: Option<String>,
-    pub markets: Option<Vec<String>>,
-    pub portfolio_capital_usd: Option<f64>,
-    pub max_positions: Option<usize>,
-    /// May the task finish without its orders if their approval is refused?
-    #[serde(default = "yes")]
-    pub orders_optional: bool,
-    /// The trigger's own ID, for deduplication. Derived from the request when absent.
-    pub trigger_key: Option<String>,
-}
-
-fn yes() -> bool {
-    true
-}
-
-fn frame_request(h: &Harness, r: &TaskRequest) -> FrameRequest {
-    FrameRequest {
-        goal: r.goal.clone(),
-        as_of_date: r.as_of_date.clone(),
-        markets: r
-            .markets
-            .clone()
-            .unwrap_or_else(|| h.strategy.markets.clone()),
-        portfolio_capital: r.portfolio_capital_usd.map(UsdCents::from_dollars),
-        max_positions: r.max_positions.unwrap_or(h.strategy.research.max_positions),
-        orders_optional: r.orders_optional,
-    }
-}
 
 #[derive(Deserialize)]
 struct ListQuery {
@@ -504,7 +512,7 @@ async fn states() -> Json<Value> {
 }
 
 async fn task_types(State(app): State<App>) -> Json<Value> {
-    Json(json!([app.harness().task_type]))
+    Json(json!([task_type_view(&app.harness().task_type)]))
 }
 
 async fn create_task(
@@ -513,24 +521,8 @@ async fn create_task(
     Body(req): Body<TaskRequest>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let h = app.harness();
-    let trigger_key = match &req.trigger_key {
-        Some(key) => key.clone(),
-        None => {
-            let basis =
-                serde_json::to_string(&(&user, &req)).map_err(|e| invalid(e.to_string()))?;
-            format!("api:{}", &sha256_hex(basis.as_bytes())[..16])
-        }
-    };
-    let intake = Intake {
-        trigger_key,
-        requester_id: user,
-        acting_principal: "quant_research_svc".into(),
-        trigger_source: "api".into(),
-        markets: h.strategy.markets.clone(),
-    };
-    let (task, created) = h.admit(&intake).await?;
+    let (task, created) = h.start(&user, "api", &req).await?;
     if created {
-        h.frame(&task.task_id, &frame_request(h, &req)).await?;
         app.announce("task.created", &task.task_id).await;
     }
     let status = if created {
@@ -564,14 +556,26 @@ async fn task_detail(
     Ok(Json(detail(app.harness(), &TaskId::new(id)).await?))
 }
 
+/// The task's ID, after checking the task exists.
+async fn require_task(h: &Harness, id: String) -> ApiResult<TaskId> {
+    let id = TaskId::new(id);
+    h.task(&id).await?;
+    Ok(id)
+}
+
+/// Announce the change on the stream and return the task as it is now.
+async fn updated(app: &App, id: &TaskId) -> ApiResult<Json<Value>> {
+    app.announce("task.updated", id).await;
+    Ok(Json(detail(app.harness(), id).await?))
+}
+
 async fn task_events(
     State(app): State<App>,
     _: User,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
-    let id = TaskId::new(id);
-    h.task(&id).await?;
+    let id = require_task(h, id).await?;
     let events: Vec<Value> = h
         .store
         .events(&id)
@@ -593,9 +597,15 @@ async fn task_actions(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
-    let id = TaskId::new(id);
-    h.task(&id).await?;
-    Ok(Json(json!(h.store.actions(&id).await?)))
+    let id = require_task(h, id).await?;
+    let actions: Vec<Value> = h
+        .store
+        .actions(&id)
+        .await?
+        .iter()
+        .map(action_view)
+        .collect();
+    Ok(Json(json!(actions)))
 }
 
 async fn task_evaluations(
@@ -604,12 +614,11 @@ async fn task_evaluations(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
-    let id = TaskId::new(id);
-    h.task(&id).await?;
+    let id = require_task(h, id).await?;
     Ok(Json(json!(h.store.evaluations(&id).await?)))
 }
 
-/// Run the agent's loop until it needs a person. A background worker can do the same.
+/// Run the agent's loop until it needs a person.
 async fn advance(
     State(app): State<App>,
     _: User,
@@ -645,7 +654,7 @@ async fn answer(
             "the task has no open question",
         ));
     }
-    let questions = match h.frame(&id, &frame_request(h, &req)).await? {
+    let questions = match h.frame(&id, &h.frame_request(&req)).await? {
         Framing::Ready(_) => vec![],
         Framing::NeedsInput(questions) => questions,
     };
@@ -688,24 +697,30 @@ async fn settle(
             )));
         }
     };
-    app.announce("task.updated", &id).await;
-    Ok(Json(detail(h, &id).await?))
+    updated(&app, &id).await
 }
 
-/// Cancel, reopen and hand back: who may do it, and what it does.
+/// What a person may do to a task outside the flow.
+enum Op {
+    Cancel,
+    Reopen,
+    HandBack,
+}
+
+/// Cancel and reopen are the requester's; handing back is the current owner's.
 async fn by_requester_or_owner(
     app: &App,
     user: &str,
     id: TaskId,
-    op: &str,
+    op: Op,
     reason: &str,
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
     let task = h.task(&id).await?;
     let owner = task.state().wait_meta().map(|w| w.owner_id.as_str());
     let allowed = match op {
-        "hand_back" => owner == Some(user),
-        _ => user == task.requester_id,
+        Op::HandBack => owner == Some(user),
+        Op::Cancel | Op::Reopen => user == task.requester_id,
     };
     if !allowed {
         return Err(forbidden(
@@ -714,12 +729,11 @@ async fn by_requester_or_owner(
         ));
     }
     match op {
-        "cancel" => h.cancel(&id, reason, user).await?,
-        "reopen" => h.reopen(&id, reason, user).await?,
-        _ => h.hand_back(&id, user).await?,
+        Op::Cancel => h.cancel(&id, reason, user).await?,
+        Op::Reopen => h.reopen(&id, reason, user).await?,
+        Op::HandBack => h.hand_back(&id, user).await?,
     };
-    app.announce("task.updated", &id).await;
-    Ok(Json(detail(h, &id).await?))
+    updated(app, &id).await
 }
 
 async fn cancel(
@@ -728,7 +742,7 @@ async fn cancel(
     Path(id): Path<String>,
     Body(body): Body<Reason>,
 ) -> ApiResult<Json<Value>> {
-    by_requester_or_owner(&app, &user, TaskId::new(id), "cancel", &body.reason).await
+    by_requester_or_owner(&app, &user, TaskId::new(id), Op::Cancel, &body.reason).await
 }
 
 async fn reopen(
@@ -737,7 +751,7 @@ async fn reopen(
     Path(id): Path<String>,
     Body(body): Body<Reason>,
 ) -> ApiResult<Json<Value>> {
-    by_requester_or_owner(&app, &user, TaskId::new(id), "reopen", &body.reason).await
+    by_requester_or_owner(&app, &user, TaskId::new(id), Op::Reopen, &body.reason).await
 }
 
 async fn hand_back(
@@ -745,7 +759,7 @@ async fn hand_back(
     User(user): User,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    by_requester_or_owner(&app, &user, TaskId::new(id), "hand_back", "").await
+    by_requester_or_owner(&app, &user, TaskId::new(id), Op::HandBack, "").await
 }
 
 async fn list_approvals(
@@ -850,15 +864,6 @@ async fn stream(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, 
 /// existing demo tasks as they are.
 async fn dev_seed(State(app): State<App>) -> ApiResult<Json<Value>> {
     let h = app.harness();
-    let request = |as_of: Option<&str>| TaskRequest {
-        goal: "Point-in-time value and quality rebalance".into(),
-        as_of_date: as_of.map(str::to_string),
-        markets: None,
-        portfolio_capital_usd: Some(1_000_000.0),
-        max_positions: None,
-        orders_optional: true,
-        trigger_key: None,
-    };
     let mut seeded = BTreeMap::new();
     for name in [
         "queued",
@@ -870,18 +875,19 @@ async fn dev_seed(State(app): State<App>) -> ApiResult<Json<Value>> {
         "declined",
         "handed-off",
     ] {
-        let intake = Intake {
-            trigger_key: format!("demo:{name}"),
-            requester_id: "alice".into(),
-            acting_principal: "quant_research_svc".into(),
-            trigger_source: "dev_seed".into(),
-            markets: h.strategy.markets.clone(),
+        let key = format!("demo:{name}");
+        let (task, created) = if name == "queued" {
+            h.admit(&h.intake(&key, "alice", "dev_seed")).await?
+        } else {
+            let mut request = h.rebalance_request("2026-02-10");
+            request.trigger_key = Some(key);
+            if name == "needs-input" {
+                request.as_of_date = None;
+            }
+            h.start("alice", "dev_seed", &request).await?
         };
-        let (task, created) = h.admit(&intake).await?;
         let id = task.task_id;
         if created && name != "queued" {
-            let as_of = (name != "needs-input").then_some("2026-02-10");
-            h.frame(&id, &frame_request(h, &request(as_of))).await?;
             if name == "handed-off" {
                 h.hand_off(&id, "demo_hand_off").await?;
             } else if name != "needs-input" {

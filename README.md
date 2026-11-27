@@ -31,13 +31,12 @@
 # 全部测试:单元、属性测试、和 Python 版的逐项比对、端到端、HTTP 接口
 cargo test --workspace
 
-# 演示:回测和各期打分,然后一个任务从受理走到结案,经过两次人工批准
-cargo run -p trade-server --bin trade -- demo
+# 一个任务从受理走到交付:不配模型时按固定规则,bob 批准两次,最后一行是 JSON 结果
+cargo run -p trade-server --bin trade -- agent --approve-as approver_bob
 
-# 单独跑回测、单日研究、打分速度
+# 回测;单日研究和委员会建议的权重。都输出 JSON
 cargo run -p trade-server --bin trade -- backtest
 cargo run -p trade-server --bin trade -- research --as-of 2026-02-10
-cargo run --release -p trade-server --bin trade -- bench
 
 # 启动接口,带联调接口,数据存在 trade.db
 cargo run -p trade-server --bin trade -- serve --dev --db trade.db

@@ -297,7 +297,7 @@ async fn an_unreachable_model_leaves_the_task_unchanged() {
     let before = h.task(&task).await.unwrap();
     let err = h.advance(&task).await.unwrap_err();
     assert!(
-        matches!(err, GateError::Storage(ref m) if m.starts_with("model_unreachable")),
+        matches!(err, GateError::External(ref m) if m.starts_with("model_unreachable")),
         "{err:?}"
     );
     let after = h.task(&task).await.unwrap();
