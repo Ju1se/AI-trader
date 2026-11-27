@@ -177,10 +177,9 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 | 要反复试的东西 | 放在哪里 | 改了之后 |
 |---|---|---|
-| 策略参数:因子权重、扣分和否决阈值、委员会权重、分歧度阈值、仓位上限、回测设置 | `config/strategy.toml` | 不用重新编译,重新运行即可。写错的键名直接报错 |
+| 策略参数:因子权重、扣分和否决阈值、委员会权重、分歧度阈值、仓位上限、回测设置;三个专家的权重、满分尺度、关键词和置信度 | `config/strategy.toml` | 不用重新编译,重新运行即可。写错的键名直接报错 |
 | 风险分级、上限、放权级别、等待期限 | `config/task_types/*.toml`,启动时写入库 | 不用重新编译;要重启,并升版本号 |
 | 演示和测试用的市场数据 | `fixtures/market.json` | 不用重新编译 |
-| 专家的打分规则 | 还在 `crates/trade-research` 的代码里 | 要重新编译。接入模型时改为提示词和评分标准文件 |
 | 状态机、闸门判定 | core 和 gate 里的纯函数 | `cargo test -p trade-core -p trade-gate` 几秒出结果,不需要数据库 |
 | 迁移有没有改变行为 | Python 版的基准文件 `crates/trade-server/tests/golden/python-mvp.json` | 每次 `cargo test` 自动比对 |
 | 前端联调 | `/v1/dev` 下的载入演示任务、拨快时钟、券商故障 | 不需要真的 Agent |
@@ -244,7 +243,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 | 编号 | 问题 | 结果 |
 |---|---|---|
-| D1 | 策略参数写死在代码里 | 因子、委员会、组合、研究范围、回测的参数已移到 `config/strategy.toml`。三个专家的打分规则(约 25 个数)还在代码里,接入模型时一并改成文件 |
+| D1 | 策略参数写死在代码里 | 已完成。因子、委员会、组合、研究范围、回测,以及三个专家的打分规则(24 个数和 29 个关键词,`[specialists.*]`)都在 `config/strategy.toml`。测试核对文件里的专家参数等于 Python 版的默认值 |
 | D2 | 风险分级、上限、放权级别写在代码里 | 已完成:`config/task_types/*.toml`,版本不可改。改了要重启,不用重新编译 |
 | D3 | 没有演示数据文件 | 已完成:`fixtures/market.json`,从迁移前的程序导出,结果逐项一致 |
 | D4 | 没有属性测试和基准比对 | 已完成:proptest 和 Python 基准文件。没用 insta,基准文件已经够用 |
@@ -281,7 +280,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 ### 8.8 还没做的
 
-- C3 计划依赖;专家打分规则改成文件;OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
+- C3 计划依赖;OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
 - 用模型当专家(现在模型只做主 Agent 的提议);由后台任务自动推进 `advance`。
 
 ## 9. 里程碑

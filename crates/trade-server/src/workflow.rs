@@ -18,9 +18,7 @@ use trade_core::{
 };
 use trade_gate::{DispatchResult, GateOutcome, GateRequest, run};
 use trade_quant::{QuantSecurityResult, score_pit_universe};
-use trade_research::{
-    FootnoteForensicsWorker, ManagementCapAllocWorker, MoatWorker, TargetPortfolio,
-};
+use trade_research::TargetPortfolio;
 use trade_store::{MemoryItem, Store};
 
 use crate::agent::AgentModel;
@@ -574,9 +572,8 @@ impl Harness {
             let mut outputs: Vec<AgentEvidenceOutput> = Vec::new();
             if examine.contains(q.ticker.as_str()) {
                 let snap = snapshot_of[q.ticker.as_str()];
-                outputs.push(MoatWorker.evaluate(&view, snap, q, as_of, None)?);
-                outputs.push(ManagementCapAllocWorker.evaluate(&view, snap, q, as_of, None)?);
-                outputs.push(FootnoteForensicsWorker.evaluate(&view, snap, q, as_of, None)?);
+                let specialists = &self.strategy.specialists;
+                outputs = specialists.evaluate((&view, snap, q, as_of))?;
                 let cost = CostEntry::new("FRAME", "specialists", params.worker_cost, &q.ticker);
                 self.store.record_cost(&task.task_id, &cost).await?;
             }

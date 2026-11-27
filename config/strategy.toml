@@ -55,6 +55,59 @@ moat = 0.20
 management_capalloc = 0.15
 footnote_forensics = 0.20
 
+# The three specialists (D1). Weights, the size of a signal that counts as full, what a
+# keyword hit is worth, the keywords themselves, and how far a specialist trusts itself
+# without filings. These are the Python MVP's values; changing them needs no recompile.
+[specialists.moat]
+roic_spread_weight = 0.45
+roic_spread_full = 0.12     # ROIC minus WACC that counts as +1
+gp_assets_weight = 0.30
+sales_cagr_weight = 0.15
+sales_cagr_full = 0.10      # three-year sales growth that counts as +1
+per_positive_hit = 0.10
+per_negative_hit = 0.18
+max_hits = 2
+
+[specialists.moat.filings]
+positive = ["pricing power", "switching cost", "network effect", "high retention", "installed base", "scale advantage"]
+negative = ["margin compression", "commoditized", "price war", "customer churn", "lost market share"]
+missing_without_filings = 0.25
+confidence_floor = 0.10
+
+[specialists.management_capalloc]
+net_issuance_weight = 0.35
+net_issuance_full = 0.04
+insider_buying_weight = 0.25
+insider_buying_full_usd = 1_000_000.0
+dilution_weight = 0.25
+dilution_full = 0.03        # stock-based pay as a share of market value
+goodwill_jump_weight = 0.35
+goodwill_jump_full = 0.15   # rise in goodwill as a share of assets
+per_positive_hit = 0.10
+per_negative_hit = 0.15
+max_hits = 2
+
+[specialists.management_capalloc.filings]
+positive = ["roic-linked", "disciplined buyback", "insider purchase", "debt reduction", "dividend growth"]
+negative = ["overpaid acquisition", "goodwill impairment", "aggressive dilution", "insider selling", "related-party"]
+missing_without_filings = 0.20
+confidence_floor = 0.10
+
+[specialists.footnote_forensics]
+beneish_m_veto_above = -1.78 # with operating cash flow at most cfo_veto_at_most
+cfo_veto_at_most = 0.0
+accruals_weight = 0.35
+cfo_ni_weight = 0.35
+beneish_weight = 0.30
+red_flag_score = -1.0
+clean_bonus = 0.10
+
+[specialists.footnote_forensics.filings]
+positive = ["unqualified audit", "conservative accounting", "cash conversion"]
+negative = ["restatement", "material weakness", "sec investigation", "bill-and-hold", "going concern"]
+missing_without_filings = 0.25
+confidence_floor = 0.10
+
 # The backtest uses the markets and factor settings above.
 [backtest]
 top_n = 3

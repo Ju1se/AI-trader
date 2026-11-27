@@ -8,6 +8,7 @@ use serde_json::Value;
 use trade_adapters::FixtureMarket;
 use trade_core::{AsOfDate, PitMarketSource};
 use trade_quant::{audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe};
+use trade_research::Specialists;
 use trade_server::{ORDER_TOOL, Step, Strategy};
 
 fn golden() -> Value {
@@ -193,4 +194,12 @@ fn backtest_matches_the_python_mvp() {
         &want["artificial_gain_pct_points"],
         "gain",
     );
+}
+
+/// The specialists' values in `config/strategy.toml` are the Python MVP's, which are also
+/// the defaults, so the comparisons above cover the file and the defaults alike.
+#[test]
+fn the_strategy_file_holds_the_specialists_defaults() {
+    let strategy = Strategy::load(common::root().join("config/strategy.toml")).unwrap();
+    assert_eq!(strategy.specialists, Specialists::default());
 }

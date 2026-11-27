@@ -271,3 +271,8 @@ impl UntrustedFiling {
             .contains(&term.to_ascii_lowercase())
     }
 }
+
+/// Rounded to four decimals, the precision every score and weight is reported in.
+pub fn round4(x: f64) -> f64 {
+    (x * 10_000.0).round() / 10_000.0
+}

@@ -6,7 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 use trade_core::{AsOfDate, TaskTypeConfig, UsdCents, WeightBps};
 use trade_quant::{BacktestConfig, FactorParams};
-use trade_research::InvestmentCommittee;
+use trade_research::{InvestmentCommittee, Specialists};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +19,8 @@ pub struct Strategy {
     pub factors: FactorParams,
     #[serde(default)]
     pub committee: InvestmentCommittee,
+    #[serde(default)]
+    pub specialists: Specialists,
     #[serde(default)]
     pub backtest: BacktestConfig,
 }

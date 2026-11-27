@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use trade_core::{AsOfDate, Bps, PitMarketSource, UsdCents};
+use trade_core::{AsOfDate, Bps, PitMarketSource, UsdCents, round4};
 
 use crate::factors::{FactorParams, QuantSecurityResult, score_pit_universe};
 
@@ -90,10 +90,6 @@ pub struct BacktestResult {
     pub overall: WindowMetrics,
     pub in_sample: Option<WindowMetrics>,
     pub out_of_sample: Option<WindowMetrics>,
-}
-
-fn round4(x: f64) -> f64 {
-    (x * 10_000.0).round() / 10_000.0
 }
 
 fn round6(x: f64) -> f64 {

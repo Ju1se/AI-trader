@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use trade_core::{AsOfDate, FilingDate, PeriodEndDate, PitSecuritySnapshot};
+use trade_core::{AsOfDate, FilingDate, PeriodEndDate, PitSecuritySnapshot, round4};
 
 /// Weights and thresholds of the factor model. The defaults reproduce the Python
 /// baseline; `config/strategy.toml` can override any of them without recompiling.
@@ -270,10 +270,6 @@ pub fn compute_raw_factors(row: &PitSecuritySnapshot) -> (BTreeMap<String, f64>,
         -((shares_out - prev_shares_out) / prev_shares_out),
     );
     (f, raw_accruals)
-}
-
-fn round4(x: f64) -> f64 {
-    (x * 10_000.0).round() / 10_000.0
 }
 
 pub fn score_pit_universe(

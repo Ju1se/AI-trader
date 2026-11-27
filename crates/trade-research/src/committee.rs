@@ -4,10 +4,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use trade_core::{AgentEvidenceOutput, CommitteeDecision, UsdCents, WeightBps};
+use trade_core::{AgentEvidenceOutput, CommitteeDecision, UsdCents, WeightBps, round4};
 use trade_quant::QuantSecurityResult;
 
-use crate::ReadOnlyPitView;
+use trade_core::ReadOnlyPitView;
 
 /// Committee weights, escalation rule and portfolio limits. Loaded from
 /// `config/strategy.toml`, so trying other values needs no recompilation.
@@ -54,10 +54,6 @@ pub struct TargetPortfolio {
     pub weights: BTreeMap<String, WeightBps>,
     pub vetoed: BTreeMap<String, Vec<String>>,
     pub escalated: Vec<String>,
-}
-
-fn round4(v: f64) -> f64 {
-    (v * 10_000.0).round() / 10_000.0
 }
 
 impl InvestmentCommittee {
