@@ -4,17 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use trade_core::{AsOfDate, Bps, PitSecuritySnapshot, UsdCents};
+use trade_core::{AsOfDate, Bps, PitMarketSource, UsdCents};
 
-use crate::factors::{score_pit_universe, QuantSecurityResult};
-
-pub trait PitMarketSource {
-    fn get_pit_snapshot(
-        &self,
-        as_of: &AsOfDate,
-        markets: &[String],
-    ) -> Result<Vec<PitSecuritySnapshot>, String>;
-}
+use crate::factors::{FactorParams, QuantSecurityResult, score_pit_universe};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SurvivorshipAudit {
@@ -62,7 +54,9 @@ pub struct WindowMetrics {
     pub avg_rank_ic: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+/// Backtest settings. Loaded from `config/strategy.toml`, so they change without recompiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BacktestConfig {
     pub markets: Vec<String>,
     pub top_n: usize,
@@ -71,7 +65,6 @@ pub struct BacktestConfig {
     pub max_adv_participation: f64,
     pub max_single_weight: f64,
     pub buffer_band_pct: f64,
-    pub min_adv_usd: f64,
     pub oos_start_date: Option<AsOfDate>,
 }
 
@@ -85,7 +78,6 @@ impl Default for BacktestConfig {
             max_adv_participation: 0.10,
             max_single_weight: 0.40,
             buffer_band_pct: 0.20,
-            min_adv_usd: 1_000_000.0,
             oos_start_date: None,
         }
     }
@@ -191,7 +183,11 @@ fn compute_window_metrics(records: &[PeriodBacktestRecord]) -> WindowMetrics {
     } else {
         0.0
     };
-    let sharpe = if ann_vol > 1e-9 { ann_ret / ann_vol } else { 0.0 };
+    let sharpe = if ann_vol > 1e-9 {
+        ann_ret / ann_vol
+    } else {
+        0.0
+    };
     let avg_to = records.iter().map(|r| r.turnover).sum::<f64>() / (n as f64);
     let ics: Vec<f64> = records.iter().filter_map(|r| r.rank_ic).collect();
     let avg_ic = if ics.is_empty() {
@@ -211,19 +207,29 @@ fn compute_window_metrics(records: &[PeriodBacktestRecord]) -> WindowMetrics {
     }
 }
 
-fn realized_holding_return(res: &QuantSecurityResult, next_dt: Option<&AsOfDate>) -> f64 {
-    if let (Some(delist_dt), Some(delist_ret)) = (&res.delist_date, res.delist_return) {
-        if next_dt.is_none_or(|nxt| delist_dt.as_str() <= nxt.as_str()) {
-            return delist_ret;
-        }
+/// The return actually earned until the next rebalance: the delisting return if the
+/// security was delisted in between, otherwise its forward return from the data source.
+fn realized_holding_return(
+    res: &QuantSecurityResult,
+    next_dt: Option<&AsOfDate>,
+    forward: &BTreeMap<String, f64>,
+) -> Result<f64, String> {
+    if let (Some(delist_dt), Some(delist_ret)) = (&res.delist_date, res.delist_return)
+        && next_dt.is_none_or(|nxt| delist_dt.as_str() <= nxt.as_str())
+    {
+        return Ok(delist_ret);
     }
-    res.forward_1m_return
+    forward
+        .get(&res.ticker)
+        .copied()
+        .ok_or_else(|| format!("missing_forward_return:{}", res.ticker))
 }
 
 pub fn run_pit_backtest(
     source: &dyn PitMarketSource,
     rebalance_dates: &[AsOfDate],
-    config: BacktestConfig,
+    config: &BacktestConfig,
+    factors: &FactorParams,
 ) -> Result<BacktestResult, String> {
     let mut prev_weights: BTreeMap<String, f64> = BTreeMap::new();
     let mut periods = Vec::with_capacity(rebalance_dates.len());
@@ -232,7 +238,8 @@ pub fn run_pit_backtest(
     for (idx, dt) in rebalance_dates.iter().enumerate() {
         let next_dt = rebalance_dates.get(idx + 1);
         let snapshot = source.get_pit_snapshot(dt, &config.markets)?;
-        let scored = score_pit_universe(&snapshot, dt, config.min_adv_usd);
+        let forward = source.get_forward_returns(dt, &config.markets)?;
+        let scored = score_pit_universe(&snapshot, dt, factors);
 
         let eligible: Vec<&QuantSecurityResult> = scored.iter().filter(|r| !r.hard_veto).collect();
         let vetoed: Vec<String> = scored
@@ -290,17 +297,17 @@ pub fn run_pit_backtest(
 
         let turnover = 0.5 * traded_frac;
         let cost_drag = traded_frac * config.one_way_cost.as_ratio();
-        let gross_ret: f64 = new_weights
-            .iter()
-            .map(|(t, &w)| w * realized_holding_return(by_ticker[t.as_str()], next_dt))
-            .sum();
+        let mut gross_ret = 0.0;
+        for (t, &w) in &new_weights {
+            gross_ret += w * realized_holding_return(by_ticker[t.as_str()], next_dt, &forward)?;
+        }
         let net_ret = gross_ret - cost_drag;
 
         let ic_scores: Vec<f64> = eligible.iter().map(|r| r.quant_score).collect();
-        let ic_rets: Vec<f64> = eligible
+        let ic_rets = eligible
             .iter()
-            .map(|r| realized_holding_return(r, next_dt))
-            .collect();
+            .map(|r| realized_holding_return(r, next_dt, &forward))
+            .collect::<Result<Vec<f64>, String>>()?;
 
         periods.push(PeriodBacktestRecord {
             rebalance_date: dt.clone(),
@@ -345,7 +352,7 @@ pub fn run_pit_backtest(
     };
 
     Ok(BacktestResult {
-        config,
+        config: config.clone(),
         periods,
         overall,
         in_sample,
@@ -356,9 +363,15 @@ pub fn run_pit_backtest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trade_core::{FilingDate, PeriodEndDate};
+    use trade_core::{FilingDate, PeriodEndDate, PitSecuritySnapshot};
 
-    fn sample_snap(ticker: &str, bm_bv: f64, z_ebit: f64, cfo: f64, beneish: f64) -> PitSecuritySnapshot {
+    fn sample_snap(
+        ticker: &str,
+        bm_bv: f64,
+        z_ebit: f64,
+        cfo: f64,
+        beneish: f64,
+    ) -> PitSecuritySnapshot {
         PitSecuritySnapshot {
             ticker: ticker.into(),
             name: ticker.into(),
@@ -400,7 +413,6 @@ mod tests {
             wacc: 0.08,
             trade_date: "2026-02-10".into(),
             close_price: 100.0,
-            forward_1m_return: 0.05,
             adv_usd: 20_000_000.0,
             amihud_illiq: 0.01,
             momentum_12_1: 0.10,
@@ -425,9 +437,13 @@ mod tests {
             sample_snap("GOOD_B", 800.0, 240.0, 200.0, -2.6),
             sample_snap("TRAP_X", 1400.0, 180.0, -50.0, -1.1),
         ];
-        let scored = score_pit_universe(&rows, &dt, 1_000_000.0);
+        let scored = score_pit_universe(&rows, &dt, &FactorParams::default());
         let trap = scored.iter().find(|r| r.ticker == "TRAP_X").unwrap();
         assert!(trap.hard_veto);
-        assert!(trap.veto_reasons.iter().any(|s| s == "negative_cfo_positive_ni"));
+        assert!(
+            trap.veto_reasons
+                .iter()
+                .any(|s| s == "negative_cfo_positive_ni")
+        );
     }
 }

@@ -1,1037 +1,1125 @@
-//! Agent 7 5-Stage Type-State Workflow (`PREPARE -> ADMIT -> FRAME -> ACT -> CLOSE`).
-//! - Uses Diagram 4a state names (`QUEUED`, `RUNNING`, `AWAITING_INPUT`, `AWAITING_APPROVAL`,
-//!   `OUTCOME_UNKNOWN`, `LIMIT_REACHED`, `VERIFYING`, `SETTLING`, `COMPLETED`, `FAILED`,
-//!   `HANDED_OFF`, `DECLINED`, `CANCELLED`).
-//! - `IndependentVerifier` reads contracts, evaluations, worker citations, drafts, and broker
-//!   receipts 100% from `DbStore` & `PaperBrokerAdapter` — zero caller-passed verification inputs!
+//! The use cases of Diagram 0, one function per step.
+//!
+//! Every use case reads what it needs from the store, decides, and writes back guarded by
+//! the task's version. Nothing keeps a task in memory between steps, so any step can be
+//! retried after a crash or a conflict. `advance` drives a task as far as it can go without
+//! a person: research, the gated draft, the gated orders, then verification and delivery.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use trade_adapters::PaperBrokerAdapter;
+use trade_adapters::{FixtureMarket, PaperBroker};
 use trade_core::{
-    sha256_hex, ActionIntentStatus, AutonomyLevel, BudgetLimits, CommitteeDecision, Completeness,
-    DeliveryManifest, GateError, HandoffPackage, PhaseCompleted, PhaseFramed, PhaseQueued,
-    PhaseSettling, PortfolioActionPayload, RiskTier, ShapeLevel, TaskContract, TaskRecord,
-    TaskState, TaskTypeConfig, TypedTask, UsdCents, WaitMetadata, WeightBps,
+    ActionIntentRecord, ActionIntentStatus, AgentEvidenceOutput, ApprovalId, ApprovalRecord,
+    ApprovalStatus, AsOfDate, Completeness, DeliveryManifest, GateError, HandoffPackage,
+    IdempotencyKey, PitMarketSource, PitSecuritySnapshot, PortfolioActionPayload, PreDispatchError,
+    RiskTier, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction,
+    TransitionError, UsdCents, WaitMetadata, WeightBps, sha256_hex,
 };
-use trade_gate::{ActionGate, GateLedger, GateOutcome};
-use trade_quant::{score_pit_universe, QuantSecurityResult};
-use trade_store::DbStore;
+use trade_gate::{DispatchResult, GateOutcome, GateRequest, run};
+use trade_quant::{QuantSecurityResult, score_pit_universe};
 use trade_research::{
-    FootnoteForensicsWorker, InvestmentCommittee, LlmJsonReasoner, ManagementCapAllocWorker,
-    MoatWorker,
+    FootnoteForensicsWorker, ManagementCapAllocWorker, MoatWorker, TargetPortfolio,
 };
+use trade_store::{CostEntry, MemoryItem, Store};
 
-use crate::tools::{CreateRebalanceDraftTool, CredentialVault, SubmitPaperOrdersTool};
+use crate::config::Strategy;
+use crate::tools::{CreateDraft, DRAFT_TOOL, ORDER_TOOL, SubmitOrders};
 
-pub fn build_default_config(
-    autonomy_level: AutonomyLevel,
-    config_admin_id: &str,
-    budget_limits: Option<BudgetLimits>,
-) -> TaskTypeConfig {
-    let mut allowed_tools = BTreeMap::new();
-    allowed_tools.insert("read_pit_market".into(), RiskTier::R0);
-    allowed_tools.insert("read_pit_filings".into(), RiskTier::R1);
-    allowed_tools.insert("create_rebalance_draft".into(), RiskTier::R2);
-    // Diagram 3a / Requirement #6: Order submission belongs to R3; R4 is permanently prohibited!
-    allowed_tools.insert("submit_paper_orders".into(), RiskTier::R3);
-    allowed_tools.insert("direct_wire_transfer".into(), RiskTier::R4);
+/// The task type this harness runs.
+pub const REBALANCE: &str = "value_committee_rebalance";
 
-    let cfg = TaskTypeConfig {
-        task_type: "value_committee_rebalance".into(),
-        version: "2.1.0-rust".into(),
-        shape_level: ShapeLevel::MultiAgent,
-        shape_rationale: "Deterministic 15-factor Rust workflow screens full PIT universe; isolated read-only workers & InvestmentCommittee evaluate candidates.".into(),
-        autonomy_level,
-        config_admin_id: config_admin_id.into(),
-        allowed_tools,
-        budget_limits: budget_limits.unwrap_or_default(),
-        done_criteria: vec![
-            "citations_pit_valid".into(),
-            "no_vetoed_holdings".into(),
-            "portfolio_constraints_valid".into(),
-            "executed_actions_readback_verified".into(),
-        ],
-    };
-    cfg.validate().expect("default TaskTypeConfig must be valid");
-    cfg
-}
+/// The done criteria the verifier knows how to check. Any other name fails closed.
+const CITATIONS: &str = "citations_pit_valid";
+const HOLDINGS: &str = "no_vetoed_holdings";
+const CONSTRAINTS: &str = "portfolio_constraints_valid";
+const ACTIONS: &str = "executed_actions_readback_verified";
 
-pub struct IndependentVerifier {
-    pub max_adv_participation: f64,
-}
+/// `advance` stops after this many rounds; every round either changes the task or returns.
+const MAX_ROUNDS: usize = 64;
 
-impl Default for IndependentVerifier {
-    fn default() -> Self {
-        Self {
-            max_adv_participation: 0.10,
-        }
-    }
-}
-
-impl IndependentVerifier {
-    /// Requirement #2: Reads ALL verification facts (contract, evaluations, worker citations,
-    /// draft weights, action ledger, and broker receipts) directly from `DbStore` & `PaperBrokerAdapter`!
-    pub async fn verify_from_db(
-        &self,
-        store: &DbStore,
-        broker: &PaperBrokerAdapter,
-        task_id: &str,
-    ) -> Result<(bool, BTreeMap<String, bool>, Vec<String>), GateError> {
-        let mut gaps = Vec::new();
-        let Some(contract) = store.get_contract(task_id).await? else {
-            let failed = BTreeMap::from([
-                ("citations_pit_valid".into(), false),
-                ("no_vetoed_holdings".into(), false),
-                ("portfolio_constraints_valid".into(), false),
-                ("executed_actions_readback_verified".into(), false),
-            ]);
-            gaps.push("missing_task_contract".into());
-            return Ok((false, failed, gaps));
-        };
-
-        let evals = store.get_stored_evaluations(task_id).await?;
-        let evidences = store.get_worker_evidences_from_db(task_id).await?;
-        let draft_opt = store.get_latest_draft_for_task(task_id).await?;
-
-        // 1. Every cited_record_id in DB worker_evidences exists in PIT DB with filing_date <= as_of_date
-        let mut citations_ok = !evidences.is_empty();
-        if evidences.is_empty() {
-            gaps.push("no_worker_evidences_recorded".into());
-        }
-        for out in &evidences {
-            for rid in &out.cited_record_ids {
-                if !store.verify_record_pit(rid, &contract.as_of_date).await? {
-                    citations_ok = false;
-                    gaps.push(format!("invalid_or_future_citation:{}:{rid}", out.ticker));
-                }
-            }
-        }
-
-        // 2 & 3. Draft holdings contain zero DB-vetoed tickers & satisfy weight/ADV invariants
-        let mut no_veto_ok = true;
-        let mut constraints_ok = true;
-        if let Some(draft) = &draft_opt {
-            let cap_usd = contract.portfolio_capital.to_dollars().max(1.0);
-            let total_bps: u32 = draft.weights.values().map(|w| u32::from(w.bps())).sum();
-            if total_bps > 10_000 {
-                constraints_ok = false;
-                gaps.push("total_weight_exceeds_10000_bps".into());
-            }
-            for (ticker, w) in &draft.weights {
-                match evals.get(ticker) {
-                    Some(ev) => {
-                        if ev.hard_veto {
-                            no_veto_ok = false;
-                            gaps.push(format!("vetoed_ticker_in_draft:{ticker}"));
-                        }
-                        let adv_cap_bps = WeightBps::from_ratio_clamped(
-                            (self.max_adv_participation * ev.adv_usd) / cap_usd,
-                        )
-                        .bps();
-                        if w.bps() > adv_cap_bps.saturating_add(1) {
-                            constraints_ok = false;
-                            gaps.push(format!("adv_cap_exceeded:{ticker}"));
-                        }
-                    }
-                    None => {
-                        no_veto_ok = false;
-                        gaps.push(format!("unevaluated_ticker_in_draft:{ticker}"));
-                    }
-                }
-            }
-        } else {
-            no_veto_ok = false;
-            constraints_ok = false;
-            gaps.push("missing_rebalance_draft".into());
-        }
-
-        // 4. Every action in action_ledger is VERIFIED and independently confirmed against broker/DB
-        let actions = store.list_task_actions(task_id).await?;
-        let mut readback_ok = !actions.is_empty();
-        if actions.is_empty() {
-            gaps.push("no_actions_recorded".into());
-        }
-        for act in &actions {
-            if act.status != ActionIntentStatus::Verified || !act.readback_verified {
-                readback_ok = false;
-                gaps.push(format!(
-                    "unverified_action:{}:{}",
-                    act.idempotency_key,
-                    act.status.as_str()
-                ));
-                continue;
-            }
-            if act.tool_name == "submit_paper_orders" {
-                let broker_ok = act
-                    .backend_receipt_id
-                    .as_deref()
-                    .and_then(|rid| broker.get_order_by_receipt(rid))
-                    .is_some_and(|o| o.status == "FILLED");
-                if !broker_ok {
-                    readback_ok = false;
-                    gaps.push(format!("broker_receipt_missing_or_unfilled:{}", act.idempotency_key));
-                }
-            }
-        }
-
-        let criteria = BTreeMap::from([
-            ("citations_pit_valid".into(), citations_ok),
-            ("no_vetoed_holdings".into(), no_veto_ok),
-            ("portfolio_constraints_valid".into(), constraints_ok),
-            ("executed_actions_readback_verified".into(), readback_ok),
-        ]);
-        let passed = criteria.values().all(|&v| v);
-        Ok((passed, criteria, gaps))
-    }
-}
-
+/// A trigger arriving at ADMIT.
 #[derive(Debug, Clone)]
-pub struct ResearchRunOutput {
-    pub gate_outcome: Option<GateOutcome<String>>,
-    pub quant_results: Vec<QuantSecurityResult>,
-    pub decisions: Vec<CommitteeDecision>,
-    pub payload: PortfolioActionPayload,
-    pub vetoed: BTreeMap<String, Vec<String>>,
-    pub escalated: Vec<String>,
+pub struct Intake {
+    /// Deduplicates triggers: the same key always yields the same task.
+    pub trigger_key: String,
+    pub requester_id: String,
+    pub acting_principal: String,
+    pub trigger_source: String,
+    pub markets: Vec<String>,
 }
 
+/// What the requester asked for, before FRAME checks it.
+#[derive(Debug, Clone)]
+pub struct FrameRequest {
+    pub goal: String,
+    pub as_of_date: Option<String>,
+    pub markets: Vec<String>,
+    pub portfolio_capital: Option<UsdCents>,
+    pub max_positions: usize,
+    /// May the task finish without placing orders if their approval is refused?
+    pub orders_optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Framing {
+    Ready(TaskContract),
+    /// The request was ambiguous; the requester was asked these questions.
+    NeedsInput(Vec<String>),
+}
+
+/// Where `advance` stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Step {
+    NeedsApproval {
+        approval_id: ApprovalId,
+        tool: String,
+    },
+    /// The gate refused the proposed action. The reason is data for the next proposal.
+    Denied(String),
+    /// Verified and delivered; SETTLING until confirmed or the settlement window closes.
+    Delivered(DeliveryManifest),
+    /// A person owns the task now.
+    HandedOff(String),
+    /// Nothing to do until someone acts; the task is in this state.
+    Waiting(&'static str),
+}
+
+/// Result of checking the done criteria against stored facts only.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReconcileOutcome {
-    pub reconciled: bool,
-    pub action_needed: bool,
-    pub receipt_id: Option<String>,
+pub struct Verification {
+    pub criteria: BTreeMap<String, bool>,
+    pub gaps: Vec<String>,
 }
 
-pub struct VerifyOutcome {
-    pub manifest: DeliveryManifest,
-    /// Present ONLY when all 4 independent DB verification checks passed (`VERIFYING -> SETTLING`).
-    pub settling_task: Option<TypedTask<PhaseSettling>>,
+impl Verification {
+    pub fn passed(&self) -> bool {
+        self.criteria.values().all(|ok| *ok)
+    }
+
+    fn fail(&mut self, criterion: &str, gap: impl Into<String>) {
+        self.criteria.insert(criterion.into(), false);
+        self.gaps.push(gap.into());
+    }
 }
 
-pub struct TradeAiHarness {
-    pub config: TaskTypeConfig,
-    pub vault: CredentialVault,
-    pub broker: PaperBrokerAdapter,
-    pub committee: InvestmentCommittee,
-    pub verifier: IndependentVerifier,
+pub struct Harness {
+    pub store: Store,
+    pub market: FixtureMarket,
+    pub broker: PaperBroker,
+    pub strategy: Strategy,
+    /// The task type version new tasks start with.
+    pub task_type: TaskTypeConfig,
+    /// The broker credential, held here and never given to workers or models.
+    pub broker_api_key: Option<String>,
 }
 
-impl TradeAiHarness {
-    pub const DEFAULT_BROKER_SECRET: &'static str = "vault_rust_broker_secret_v2";
+fn not_found(what: &str, id: &str) -> GateError {
+    GateError::Storage(format!("{what}_not_found:{id}"))
+}
 
-    pub fn new(config: TaskTypeConfig) -> Self {
-        let mut vault = CredentialVault::new();
-        vault.set_secret("paper_broker_api_key", Self::DEFAULT_BROKER_SECRET);
-        let broker = PaperBrokerAdapter::new(Self::DEFAULT_BROKER_SECRET);
-        Self {
-            config,
-            vault,
+fn not_now(task: &TaskRecord, to: &'static str) -> GateError {
+    TransitionError {
+        from: task.state().code(),
+        to,
+    }
+    .into()
+}
+
+/// The paper broker's credential in demos and tests. Paper money only.
+pub const PAPER_BROKER_KEY: &str = "paper-broker-demo-key";
+
+impl Harness {
+    /// Everything from the repository layout: `config/strategy.toml`,
+    /// `config/task_types/*.toml`, `fixtures/market.json`, and the database at `db_url`.
+    /// Then settle whatever a previous run left in flight.
+    pub async fn open(root: &std::path::Path, db_url: &str) -> Result<Self, String> {
+        let strategy = Strategy::load(root.join("config/strategy.toml"))?;
+        let task_types = crate::config::load_task_types(root.join("config/task_types"))?;
+        let market = FixtureMarket::load(root.join("fixtures/market.json"))?;
+        let store = Store::connect(db_url).await.map_err(|e| e.to_string())?;
+        let broker = PaperBroker::new(PAPER_BROKER_KEY);
+        let key = Some(PAPER_BROKER_KEY.to_string());
+        let harness = Self::new(store, market, broker, key, strategy, task_types)
+            .await
+            .map_err(|e| e.to_string())?;
+        harness.recover().await.map_err(|e| e.to_string())?;
+        Ok(harness)
+    }
+
+    /// Register the task types and seed the agents' starting calibration if the store has
+    /// none yet.
+    pub async fn new(
+        store: Store,
+        market: FixtureMarket,
+        broker: PaperBroker,
+        broker_api_key: Option<String>,
+        strategy: Strategy,
+        task_types: Vec<TaskTypeConfig>,
+    ) -> Result<Self, GateError> {
+        for config in &task_types {
+            store.put_task_type(config).await?;
+        }
+        let task_type = task_types
+            .into_iter()
+            .find(|t| t.task_type == REBALANCE)
+            .ok_or_else(|| not_found("task_type", REBALANCE))?;
+        if store.calibrations().await?.is_empty() {
+            for (agent, confidence) in market.seed_calibrations() {
+                store.set_calibration(agent, *confidence, 0.0).await?;
+            }
+        }
+        Ok(Self {
+            store,
+            market,
             broker,
-            committee: InvestmentCommittee::default(),
-            verifier: IndependentVerifier::default(),
+            strategy,
+            task_type,
+            broker_api_key,
+        })
+    }
+
+    pub fn draft_tool(&self) -> CreateDraft {
+        CreateDraft {
+            store: self.store.clone(),
         }
     }
 
-    pub fn mounted_harness_tools() -> BTreeSet<String> {
-        BTreeSet::from([
-            "create_rebalance_draft".into(),
-            "submit_paper_orders".into(),
-        ])
-    }
-
-    // --- Stage 2: ADMIT (`QUEUED`) ---
-
-    pub async fn admit_task(
-        &self,
-        store: &DbStore,
-        idempotency_trigger_key: &str,
-        requester_id: &str,
-        acting_principal: &str,
-        trigger_source: &str,
-        authorized_markets: &[String],
-    ) -> Result<(TaskRecord, bool), GateError> {
-        if let Some(existing) = store.get_task_by_trigger_key(idempotency_trigger_key).await? {
-            return Ok((existing, true));
+    pub fn order_tool(&self) -> SubmitOrders {
+        SubmitOrders {
+            store: self.store.clone(),
+            broker: self.broker.clone(),
+            api_key: self.broker_api_key.clone(),
         }
-        let short = &sha256_hex(idempotency_trigger_key.as_bytes())[..10];
-        let task = TaskRecord::new_queued(
-            format!("TASK-{short}"),
-            idempotency_trigger_key,
-            &self.config.task_type,
-            &self.config.version,
-            requester_id,
-            acting_principal,
-            trigger_source,
-            authorized_markets.to_vec(),
-        )?;
-        store.create_task(&task, trigger_source).await?;
-        Ok((task, false))
     }
 
-    // --- Stage 3: FRAME (`QUEUED -> RUNNING | AWAITING_INPUT`) ---
-
-    pub async fn frame_task(
-        &self,
-        store: &DbStore,
-        task_id: &str,
-        goal: &str,
-        as_of_date_raw: Option<&str>,
-        universe_markets: &[String],
-        portfolio_capital: Option<UsdCents>,
-        max_positions: usize,
-    ) -> Result<Result<(TypedTask<PhaseFramed>, TaskContract), TaskRecord>, GateError> {
-        let mut task = store
-            .get_task(task_id)
+    pub async fn task(&self, task_id: &TaskId) -> Result<TaskRecord, GateError> {
+        self.store
+            .task(task_id)
             .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
+            .ok_or_else(|| not_found("task", task_id))
+    }
 
-        let mut ambiguities = Vec::new();
-        let parsed_as_of = match as_of_date_raw {
-            Some(s) if !s.trim().is_empty() => match trade_core::AsOfDate::new(s) {
-                Ok(dt) => Some(dt),
-                Err(_) => {
-                    ambiguities.push("invalid_as_of_date_format");
-                    None
-                }
-            },
-            _ => {
-                ambiguities.push("missing_as_of_date");
+    async fn contract(&self, task_id: &TaskId) -> Result<TaskContract, GateError> {
+        self.store
+            .contract(task_id)
+            .await?
+            .ok_or_else(|| not_found("contract", task_id))
+    }
+
+    async fn config_of(&self, task: &TaskRecord) -> Result<TaskTypeConfig, GateError> {
+        self.store
+            .task_type(&task.task_type, &task.config_version)
+            .await?
+            .ok_or_else(|| not_found("task_type", &task.config_version))
+    }
+
+    // ---- ADMIT and FRAME -------------------------------------------------------------
+
+    /// ADMIT: create the task, or return the one this trigger already created.
+    pub async fn admit(&self, intake: &Intake) -> Result<(TaskRecord, bool), GateError> {
+        let id = format!("TASK-{}", &sha256_hex(intake.trigger_key.as_bytes())[..10]);
+        let task = TaskRecord::new_queued(
+            TaskId::new(id),
+            &intake.trigger_key,
+            &self.task_type.task_type,
+            &self.task_type.version,
+            &intake.requester_id,
+            &intake.acting_principal,
+            &intake.trigger_source,
+            intake.markets.clone(),
+        )?;
+        self.store.create_task(&task, &intake.trigger_source).await
+    }
+
+    /// FRAME: pin the task contract, or ask the requester when the request is ambiguous.
+    /// Also takes the answer to an earlier question.
+    pub async fn frame(&self, task_id: &TaskId, req: &FrameRequest) -> Result<Framing, GateError> {
+        let mut task = self.task(task_id).await?;
+        if !matches!(
+            task.state(),
+            TaskState::Queued | TaskState::AwaitingInput(_)
+        ) {
+            return Err(not_now(&task, "RUNNING"));
+        }
+        let config = self.config_of(&task).await?;
+        let now = self.store.now();
+        let mut questions = Vec::new();
+        let as_of = match req.as_of_date.as_deref().map(str::trim) {
+            None | Some("") => {
+                questions.push("missing_as_of_date");
                 None
             }
+            Some(raw) => AsOfDate::new(raw)
+                .inspect_err(|_| questions.push("invalid_as_of_date"))
+                .ok(),
         };
-
-        if portfolio_capital.is_none_or(|c| c.cents() <= 0) {
-            ambiguities.push("missing_or_non_positive_capital");
+        if req.portfolio_capital.is_none_or(|c| c.cents() <= 0) {
+            questions.push("missing_or_non_positive_capital");
         }
-        if universe_markets.is_empty() {
-            ambiguities.push("empty_universe_markets");
-        } else if universe_markets
+        if req.markets.is_empty() {
+            questions.push("empty_universe_markets");
+        } else if req
+            .markets
             .iter()
             .any(|m| !task.authorized_markets.contains(m))
         {
-            ambiguities.push("requested_market_outside_authorized_scope");
+            questions.push("market_outside_authorized_scope");
+        }
+        if req.max_positions == 0 {
+            questions.push("max_positions_must_be_positive");
         }
 
-        if !ambiguities.is_empty() {
-            if matches!(task.state(), TaskState::Queued) {
-                task.transition(TaskState::Running)?;
-                store
-                    .save_task_optimistic(&mut task, "admitted_for_framing", "harness")
-                    .await?;
-            }
-            let wm = WaitMetadata::new(
-                task.requester_id.clone(),
-                "2099-12-31T23:59:59Z",
-                "cancel_unclarified_task",
-            )?;
-            task.transition(TaskState::AwaitingInput(wm))?;
-            store
-                .save_task_optimistic(
-                    &mut task,
-                    &format!("awaiting_input:{}", ambiguities.join(",")),
-                    "harness",
-                )
-                .await?;
-            return Ok(Err(task));
-        }
-
+        task.transition(TaskState::Running, now)?;
+        let (Some(as_of_date), Some(portfolio_capital), true) =
+            (as_of, req.portfolio_capital, questions.is_empty())
+        else {
+            let deadline = now + config.waits.input_ttl_s;
+            let wait = WaitMetadata::new(&task.requester_id, deadline, TimeoutAction::HandOff)?;
+            task.transition(TaskState::AwaitingInput(wait), now)?;
+            let reason = format!("needs_input:{}", questions.join(","));
+            self.store.save(&mut task, &reason, "frame").await?;
+            return Ok(Framing::NeedsInput(
+                questions.iter().map(|q| q.to_string()).collect(),
+            ));
+        };
         let contract = TaskContract {
             task_id: task.task_id.clone(),
-            goal: goal.into(),
-            as_of_date: parsed_as_of.unwrap(),
-            universe_markets: universe_markets.to_vec(),
-            portfolio_capital: portfolio_capital.unwrap(),
-            max_positions,
+            goal: req.goal.clone(),
+            as_of_date,
+            universe_markets: req.markets.clone(),
+            portfolio_capital,
+            max_positions: req.max_positions,
             expected_outputs: vec![
                 "quant_ranking".into(),
                 "committee_decisions".into(),
                 "rebalance_draft".into(),
                 "delivery_manifest".into(),
             ],
-            done_checks: self.config.done_criteria.clone(),
+            done_checks: config.done_criteria.clone(),
             assumptions: vec![
-                "accounting_lag_enforced_by_filing_date_type".into(),
-                "pit_survivor_bias_free".into(),
+                "accounting_lag_enforced_by_filing_date".into(),
+                "point_in_time_universe_without_survivor_bias".into(),
             ],
-            irreversible_steps_deferred: true,
+            irreversible_steps_deferred: req.orders_optional,
         };
-        store.save_contract(&contract).await?;
-
-        if matches!(task.state(), TaskState::Queued) {
-            let queued = TypedTask::<PhaseQueued>::from_queued(task)?;
-            let framed = queued.into_framed()?;
-            let mut rec = framed.into_record();
-            store
-                .save_task_optimistic(&mut rec, "contract_pinned", "harness")
-                .await?;
-            let mut tmp = rec.clone();
-            tmp.transition(TaskState::Verifying)?;
-            let _ = tmp;
-            // Re-wrap cleanly via PhaseQueued helper on fresh running record:
-            Ok(Ok((
-                TypedTask::<PhaseQueued>::from_queued(TaskRecord::new_queued(
-                    &rec.task_id,
-                    &rec.idempotency_trigger_key,
-                    &rec.task_type,
-                    &rec.config_version,
-                    &rec.requester_id,
-                    &rec.acting_principal,
-                    &rec.trigger_source,
-                    rec.authorized_markets.clone(),
-                )?)?
-                .into_framed()?,
-                contract,
-            )))
-        } else {
-            task.transition(TaskState::Running)?;
-            store
-                .save_task_optimistic(&mut task, "clarified_and_pinned", "harness")
-                .await?;
-            let dummy = TypedTask::<PhaseQueued>::from_queued(TaskRecord::new_queued(
-                &task.task_id,
-                &task.idempotency_trigger_key,
-                &task.task_type,
-                &task.config_version,
-                &task.requester_id,
-                &task.acting_principal,
-                &task.trigger_source,
-                task.authorized_markets.clone(),
-            )?)?
-            .into_framed()?;
-            Ok(Ok((dummy, contract)))
-        }
+        self.store.save_contract(&contract).await?;
+        self.store
+            .save(&mut task, "contract_pinned", "frame")
+            .await?;
+        Ok(Framing::Ready(contract))
     }
 
-    // --- Stage 3/4: Research + Gated Draft (`R2`) ---
+    // ---- The execution loop ------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn run_research_and_draft(
-        &self,
-        store: &DbStore,
-        task_id: &str,
-        draft_approval_id: Option<&str>,
-        audit_vetoed_tickers: &[String],
-        max_research_candidates: usize,
-        min_adv_usd: f64,
-        reasoner: Option<&dyn LlmJsonReasoner>,
-    ) -> Result<ResearchRunOutput, GateError> {
-        let mut task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        let contract = store
-            .get_contract(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("missing_contract:{task_id}")))?;
-
-        if task.turns_used >= self.config.budget_limits.max_turns
-            || task.spend >= self.config.budget_limits.usable_execution_spend()
-        {
-            if !matches!(task.state(), TaskState::LimitReached { .. }) {
-                task.transition(TaskState::LimitReached {
-                    reason: "pre_research_limit_reached".into(),
-                })?;
-                store
-                    .save_task_optimistic(&mut task, "pre_research_limit_reached", "harness")
-                    .await?;
+    /// Drive the task until it needs a person or is delivered. Each round reads the task
+    /// again, so this is safe to call at any time, any number of times.
+    pub async fn advance(&self, task_id: &TaskId) -> Result<Step, GateError> {
+        for _ in 0..MAX_ROUNDS {
+            let task = self.task(task_id).await?;
+            let step = match task.state() {
+                TaskState::Running => self.act(task).await?,
+                TaskState::LimitReached { .. } => self.close(task).await?,
+                TaskState::OutcomeUnknown { .. } => {
+                    if self.reconcile(task_id).await? {
+                        None
+                    } else {
+                        Some(
+                            self.hand_off(task_id, "outcome_unknown_after_reconciliation")
+                                .await?,
+                        )
+                    }
+                }
+                other => Some(Step::Waiting(other.code())),
+            };
+            if let Some(step) = step {
+                return Ok(step);
             }
-            return Err(trade_core::PreDispatchError::LimitReached(
-                "pre_research_limit_reached".into(),
-            )
-            .into());
         }
+        Err(GateError::Conflict(format!(
+            "task {task_id} did not settle"
+        )))
+    }
 
-        let snapshots = store
+    /// One round of ACT: research once, then the draft, then the orders, then CLOSE.
+    /// `None` means something changed and the loop should look again.
+    async fn act(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
+        let contract = self.contract(&task.task_id).await?;
+        if self.store.evaluations(&task.task_id).await?.is_empty() {
+            self.research(&mut task, &contract).await?;
+            return Ok(None);
+        }
+        let actions = self.store.actions(&task.task_id).await?;
+        let done = |tool: &str| {
+            actions
+                .iter()
+                .any(|a| a.tool_name == tool && a.status == ActionIntentStatus::Verified)
+        };
+        let approvals = self.store.task_approvals(&task.task_id).await?;
+        let approved = |tool: &str| {
+            approvals
+                .iter()
+                .find(|a| a.tool_name == tool && a.status == ApprovalStatus::Approved)
+                .map(|a| a.approval_id.clone())
+        };
+        let as_of = contract.as_of_date.as_str();
+
+        if !done(DRAFT_TOOL) {
+            let request = GateRequest {
+                task_id: task.task_id.clone(),
+                target: format!("portfolio:{as_of}"),
+                args: self.proposal(&task.task_id).await?.0,
+                idempotency_key: IdempotencyKey::new(format!("draft:{}:{as_of}", task.task_id)),
+                approval_id: approved(DRAFT_TOOL),
+            };
+            return gated(
+                run(&self.store, &self.draft_tool(), &request).await,
+                DRAFT_TOOL,
+            );
+        }
+        if !done(ORDER_TOOL) && !refused(&approvals, ORDER_TOOL) {
+            let draft = self
+                .store
+                .latest_draft(&task.task_id)
+                .await?
+                .ok_or_else(|| not_found("draft", &task.task_id))?;
+            let request = GateRequest {
+                task_id: task.task_id.clone(),
+                target: format!("paper_broker:{as_of}"),
+                args: PortfolioActionPayload {
+                    draft_id: draft.draft_id,
+                    as_of_date: contract.as_of_date.clone(),
+                    weights_bps: draft.weights,
+                    markets: contract.universe_markets.clone(),
+                    portfolio_capital_cents: Some(contract.portfolio_capital),
+                },
+                idempotency_key: IdempotencyKey::new(format!("order:{}:{as_of}", task.task_id)),
+                approval_id: approved(ORDER_TOOL),
+            };
+            let result = run(&self.store, &self.order_tool(), &request).await;
+            if let Ok(GateOutcome::Executed {
+                receipt_id,
+                replayed: false,
+                ..
+            }) = &result
+            {
+                let cost = CostEntry {
+                    stage: "ACT".into(),
+                    category: "broker".into(),
+                    amount: UsdCents::from_cents(1),
+                    human_minutes: 0.0,
+                    note: receipt_id.clone(),
+                };
+                self.store.record_cost(&task.task_id, &cost).await?;
+            }
+            return gated(result, ORDER_TOOL);
+        }
+        self.close(task).await
+    }
+
+    /// The quant screen on the contract's date: what was public then, scored. Pure and
+    /// free, so it is recomputed rather than stored.
+    fn screen(
+        &self,
+        contract: &TaskContract,
+    ) -> Result<(Vec<PitSecuritySnapshot>, Vec<QuantSecurityResult>), GateError> {
+        let snapshots = self
+            .market
             .get_pit_snapshot(&contract.as_of_date, &contract.universe_markets)
-            .await?;
-        let snap_by_ticker: BTreeMap<String, _> = snapshots
-            .iter()
-            .map(|s| (s.ticker.clone(), s.clone()))
-            .collect();
-        let quant_results = score_pit_universe(&snapshots, &contract.as_of_date, min_adv_usd);
-        let quant_by_ticker: BTreeMap<String, QuantSecurityResult> = quant_results
-            .iter()
-            .map(|q| (q.ticker.clone(), q.clone()))
-            .collect();
+            .map_err(GateError::Storage)?;
+        let quant = score_pit_universe(&snapshots, &contract.as_of_date, &self.strategy.factors);
+        Ok((snapshots, quant))
+    }
 
-        let mut research_tickers: BTreeSet<String> = quant_results
+    /// RETRIEVE, DELEGATE and the committee: the specialists examine the best candidates
+    /// (plus the audited ones) through a read-only view, and the committee's results are
+    /// stored before any write tool may run.
+    async fn research(
+        &self,
+        task: &mut TaskRecord,
+        contract: &TaskContract,
+    ) -> Result<(), GateError> {
+        let params = &self.strategy.research;
+        let (snapshots, quant) = self.screen(contract)?;
+        let mut examine: BTreeSet<&str> = quant
             .iter()
             .filter(|q| !q.hard_veto)
-            .take(max_research_candidates)
-            .map(|q| q.ticker.clone())
+            .take(params.max_candidates)
+            .map(|q| q.ticker.as_str())
             .collect();
-        for t in audit_vetoed_tickers {
-            if quant_by_ticker.contains_key(t) {
-                research_tickers.insert(t.clone());
+        examine.extend(
+            params
+                .audit_tickers
+                .iter()
+                .map(String::as_str)
+                .filter(|t| quant.iter().any(|q| q.ticker == *t)),
+        );
+        let snapshot_of: BTreeMap<&str, &PitSecuritySnapshot> =
+            snapshots.iter().map(|s| (s.ticker.as_str(), s)).collect();
+        let view = self.market.view(
+            task.authorized_markets.clone(),
+            self.store.calibrations().await?,
+        );
+        let as_of = &contract.as_of_date;
+
+        let mut decisions = Vec::with_capacity(quant.len());
+        for q in &quant {
+            let mut outputs: Vec<AgentEvidenceOutput> = Vec::new();
+            if examine.contains(q.ticker.as_str()) {
+                let snap = snapshot_of[q.ticker.as_str()];
+                outputs.push(MoatWorker.evaluate(&view, snap, q, as_of, None)?);
+                outputs.push(ManagementCapAllocWorker.evaluate(&view, snap, q, as_of, None)?);
+                outputs.push(FootnoteForensicsWorker.evaluate(&view, snap, q, as_of, None)?);
+                let cost = CostEntry {
+                    stage: "FRAME".into(),
+                    category: "specialists".into(),
+                    amount: params.worker_cost,
+                    human_minutes: 0.0,
+                    note: q.ticker.clone(),
+                };
+                self.store.record_cost(&task.task_id, &cost).await?;
             }
+            decisions.push(self.strategy.committee.evaluate_security(q, outputs, &view));
         }
-
-        let ro_view = store
-            .build_scoped_readonly_view(&task.authorized_markets, &contract.as_of_date)
+        self.store
+            .save_evaluations(&task.task_id, &decisions)
             .await?;
-        let moat = MoatWorker;
-        let mgmt = ManagementCapAllocWorker;
-        let foren = FootnoteForensicsWorker;
+        // Recording costs updated the task; read it again before counting the turns.
+        *task = self.task(&task.task_id).await?;
+        task.turns_used += 3 * examine.len() as u32;
+        self.store.save(task, "committee_scored", "research").await
+    }
 
-        let mut decisions = Vec::with_capacity(quant_results.len());
-        for q in &quant_results {
-            let mut worker_outputs = Vec::new();
-            if research_tickers.contains(&q.ticker) {
-                let snap = &snap_by_ticker[&q.ticker];
-                worker_outputs.push(moat.evaluate(&ro_view, snap, q, &contract.as_of_date, reasoner)?);
-                worker_outputs.push(mgmt.evaluate(&ro_view, snap, q, &contract.as_of_date, reasoner)?);
-                worker_outputs.push(foren.evaluate(&ro_view, snap, q, &contract.as_of_date, reasoner)?);
-                task.turns_used += 3;
-                let step_cost = UsdCents::from_cents(3);
-                task.spend = task.spend.saturating_add(step_cost);
-                store
-                    .record_cost(
-                        &task.task_id,
-                        "specialist_workers",
-                        step_cost,
-                        0.0,
-                        &format!("workers:{}", q.ticker),
-                    )
-                    .await?;
-            }
-            decisions.push(self.committee.evaluate_security(q, worker_outputs, &ro_view));
-        }
-
-        // Persist authoritative evaluations & worker evidences in DB BEFORE calling any write tool!
-        store
-            .save_research_evaluations(&task.task_id, &decisions, &quant_by_ticker)
-            .await?;
-        store
-            .save_task_optimistic(&mut task, "committee_scored", "harness")
-            .await?;
-
-        let (weights_bps, vetoed, escalated) = self.committee.build_target_weights(
+    /// The committee's portfolio from the stored evaluations, and the draft payload for it.
+    pub async fn proposal(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<(PortfolioActionPayload, TargetPortfolio), GateError> {
+        let contract = self.contract(task_id).await?;
+        let (_, quant) = self.screen(&contract)?;
+        let quant_by_ticker: BTreeMap<String, QuantSecurityResult> =
+            quant.into_iter().map(|q| (q.ticker.clone(), q)).collect();
+        let decisions = self.store.evaluations(task_id).await?;
+        let portfolio = self.strategy.committee.build_target_weights(
             &decisions,
             &quant_by_ticker,
             contract.portfolio_capital,
             contract.max_positions,
-            WeightBps::new(3_500).unwrap(),
-            WeightBps::new(6_500).unwrap(),
-            0.10,
         );
-
-        let draft_id = format!("DRAFT-{}", task.task_id);
         let payload = PortfolioActionPayload {
-            draft_id,
-            as_of_date: contract.as_of_date.clone(),
-            weights_bps,
-            markets: contract.universe_markets.clone(),
+            draft_id: format!("DRAFT-{task_id}"),
+            as_of_date: contract.as_of_date,
+            weights_bps: portfolio.weights.clone(),
+            markets: contract.universe_markets,
             portfolio_capital_cents: None,
         };
-
-        let tool = CreateRebalanceDraftTool { store };
-        let target = format!("portfolio:{}", contract.as_of_date.as_str());
-        let idem = format!("draft:{}:{}", task.task_id, contract.as_of_date.as_str());
-
-        let gate_outcome = ActionGate::evaluate_and_execute(
-            store,
-            &tool,
-            &mut task,
-            &self.config,
-            &Self::mounted_harness_tools(),
-            &target,
-            &payload,
-            &idem,
-            draft_approval_id,
-            0,
-            false,
-        )
-        .await?;
-
-        Ok(ResearchRunOutput {
-            gate_outcome: Some(gate_outcome),
-            quant_results,
-            decisions,
-            payload,
-            vetoed,
-            escalated,
-        })
+        Ok((payload, portfolio))
     }
 
-    /// Retry/submit only the gated `create_rebalance_draft` call with a DB `approval_id`.
-    pub async fn submit_rebalance_draft(
+    // ---- CLOSE -------------------------------------------------------------------------
+
+    /// VERIFY from stored facts only, then DELIVER, rework, or hand off. From
+    /// LIMIT_REACHED, what was finished is verified and delivered as partial. `None` means
+    /// rework: the loop goes round again.
+    async fn close(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
+        let from_limit = match task.state() {
+            TaskState::LimitReached { reason } => Some(reason.clone()),
+            _ => None,
+        };
+        task.transition(TaskState::Verifying, self.store.now())?;
+        self.store.save(&mut task, "verifying", "close").await?;
+        let cost = CostEntry {
+            stage: "CLOSE".into(),
+            category: "verifier".into(),
+            amount: UsdCents::from_cents(1),
+            human_minutes: 0.0,
+            note: "independent_verification".into(),
+        };
+        self.store.record_cost(&task.task_id, &cost).await?;
+
+        let mut task = self.task(&task.task_id).await?;
+        let contract = self.contract(&task.task_id).await?;
+        let config = self.config_of(&task).await?;
+        let mut check = self.verify(&task, &contract, &config).await?;
+        let now = self.store.now();
+
+        if !check.passed() {
+            // Rework while there is budget for it; otherwise a person takes over.
+            if from_limit.is_none() && task.reworks_used < config.budget_limits.max_reworks {
+                task.transition(TaskState::Running, now)?;
+                let reason = format!("rework:{}", check.gaps.join(","));
+                self.store.save(&mut task, &reason, "close").await?;
+                return Ok(None);
+            }
+            let reason = format!("verification_failed:{}", check.gaps.join(","));
+            return self.hand_off(&task.task_id, &reason).await.map(Some);
+        }
+
+        let actions = self.store.actions(&task.task_id).await?;
+        let orders_placed = actions
+            .iter()
+            .any(|a| a.tool_name == ORDER_TOOL && a.status == ActionIntentStatus::Verified);
+        if !orders_placed {
+            let approvals = self.store.task_approvals(&task.task_id).await?;
+            check.gaps.push(if refused(&approvals, ORDER_TOOL) {
+                "orders_not_placed:approval_refused".into()
+            } else {
+                "orders_not_placed".into()
+            });
+        }
+        if let Some(limit) = &from_limit {
+            check.gaps.push(format!("stopped_by_limit:{limit}"));
+        }
+        let completeness = if orders_placed && from_limit.is_none() {
+            Completeness::Complete
+        } else {
+            Completeness::Partial
+        };
+        let draft = self.store.latest_draft(&task.task_id).await?;
+        let wait = WaitMetadata::new(
+            &task.requester_id,
+            now + config.waits.settle_window_s,
+            TimeoutAction::Complete,
+        )?;
+        task.transition(TaskState::Settling(wait), now)?;
+        let manifest = DeliveryManifest {
+            task_id: task.task_id.clone(),
+            final_state: task.state().clone(),
+            completeness,
+            criteria_results: check.criteria,
+            assumptions: contract.assumptions,
+            gaps: check.gaps,
+            total_spend: task.spend,
+            next_owner: task.requester_id.clone(),
+            draft_id: draft.as_ref().map(|d| d.draft_id.clone()),
+            weights: draft.map(|d| d.weights).unwrap_or_default(),
+        };
+        self.store.deliver(&manifest, &mut task).await?;
+        Ok(Some(Step::Delivered(manifest)))
+    }
+
+    /// The done criteria, checked against the store, the market data and the broker only;
+    /// nothing comes from the workers' or the proposer's say-so. An empty result fails.
+    pub async fn verify(
         &self,
-        store: &DbStore,
-        task_id: &str,
-        prev: &ResearchRunOutput,
-        approval_id: Option<&str>,
-    ) -> Result<GateOutcome<String>, GateError> {
-        let mut task = store
-            .get_task(task_id)
+        task: &TaskRecord,
+        contract: &TaskContract,
+        config: &TaskTypeConfig,
+    ) -> Result<Verification, GateError> {
+        let mut check = Verification {
+            criteria: BTreeMap::new(),
+            gaps: Vec::new(),
+        };
+        for criterion in &config.done_criteria {
+            check.criteria.insert(criterion.clone(), true);
+            if ![CITATIONS, HOLDINGS, CONSTRAINTS, ACTIONS].contains(&criterion.as_str()) {
+                check.fail(criterion, format!("unknown_criterion:{criterion}"));
+            }
+        }
+        let as_of = &contract.as_of_date;
+        let decisions = self.store.evaluations(&task.task_id).await?;
+
+        // Every record a specialist cites existed and was public on the as-of date.
+        let outputs: Vec<&AgentEvidenceOutput> =
+            decisions.iter().flat_map(|d| &d.worker_outputs).collect();
+        if outputs.is_empty() {
+            check.fail(CITATIONS, "no_specialist_evidence");
+        }
+        for out in &outputs {
+            for record in &out.cited_record_ids {
+                if !self.market.record_public(record, as_of) {
+                    check.fail(
+                        CITATIONS,
+                        format!("invalid_or_future_citation:{}:{record}", out.ticker),
+                    );
+                }
+            }
+        }
+
+        // The draft holds only evaluated, unvetoed securities, within the portfolio limits.
+        match self.store.latest_draft(&task.task_id).await? {
+            None => {
+                check.fail(HOLDINGS, "missing_rebalance_draft");
+                check.fail(CONSTRAINTS, "missing_rebalance_draft");
+            }
+            Some(draft) => {
+                let vetoed: BTreeMap<&str, bool> = decisions
+                    .iter()
+                    .map(|d| (d.ticker.as_str(), d.hard_veto))
+                    .collect();
+                for ticker in draft.weights.keys() {
+                    match vetoed.get(ticker.as_str()) {
+                        None => {
+                            check.fail(HOLDINGS, format!("unevaluated_ticker_in_draft:{ticker}"))
+                        }
+                        Some(true) => {
+                            check.fail(HOLDINGS, format!("vetoed_ticker_in_draft:{ticker}"))
+                        }
+                        Some(false) => {}
+                    }
+                }
+                self.check_limits(&mut check, &draft.weights, contract)?;
+            }
+        }
+
+        // Every action was verified, and the broker still shows exactly those orders.
+        let actions = self.store.actions(&task.task_id).await?;
+        if actions.is_empty() {
+            check.fail(ACTIONS, "no_actions_recorded");
+        }
+        for action in &actions {
+            let key = &action.idempotency_key;
+            if action.status != ActionIntentStatus::Verified || !action.readback_verified {
+                check.fail(
+                    ACTIONS,
+                    format!("unverified_action:{key}:{}", action.status.as_str()),
+                );
+            } else if action.tool_name == ORDER_TOOL {
+                let seen = self.order_tool().reconcile(action).await?;
+                let expected = action.backend_receipt_id.clone().unwrap_or_default();
+                if seen
+                    != (DispatchResult::Verified {
+                        receipt_id: expected,
+                    })
+                {
+                    check.fail(ACTIONS, format!("broker_readback_mismatch:{key}"));
+                }
+            }
+        }
+        Ok(check)
+    }
+
+    /// Total, single-position, industry and liquidity limits, using the market data of the
+    /// as-of date rather than anything the committee reported.
+    fn check_limits(
+        &self,
+        check: &mut Verification,
+        weights: &BTreeMap<String, WeightBps>,
+        contract: &TaskContract,
+    ) -> Result<(), GateError> {
+        let committee = &self.strategy.committee;
+        let (snapshots, _) = self.screen(contract)?;
+        let row: BTreeMap<&str, &PitSecuritySnapshot> =
+            snapshots.iter().map(|s| (s.ticker.as_str(), s)).collect();
+        let total: u32 = weights.values().map(|w| u32::from(w.bps())).sum();
+        if total > 10_000 {
+            check.fail(CONSTRAINTS, "total_weight_exceeds_10000_bps");
+        }
+        let capital = contract.portfolio_capital.to_dollars().max(1.0);
+        let mut by_industry: BTreeMap<&str, u32> = BTreeMap::new();
+        for (ticker, weight) in weights {
+            let Some(s) = row.get(ticker.as_str()) else {
+                check.fail(CONSTRAINTS, format!("not_in_universe:{ticker}"));
+                continue;
+            };
+            if weight.bps() > committee.max_single_weight.bps() {
+                check.fail(CONSTRAINTS, format!("single_weight_exceeded:{ticker}"));
+            }
+            let adv_cap = WeightBps::from_ratio_clamped(
+                committee.max_adv_participation * s.adv_usd / capital,
+            );
+            // One basis point of slack for rounding.
+            if weight.bps() > adv_cap.bps().saturating_add(1) {
+                check.fail(CONSTRAINTS, format!("adv_cap_exceeded:{ticker}"));
+            }
+            *by_industry.entry(s.industry.as_str()).or_default() += u32::from(weight.bps());
+        }
+        for (industry, bps) in by_industry {
+            if bps > u32::from(committee.max_industry_weight.bps()) {
+                check.fail(CONSTRAINTS, format!("industry_weight_exceeded:{industry}"));
+            }
+        }
+        Ok(())
+    }
+
+    // ---- People: approvals, settlement, hand-offs ----------------------------------------
+
+    /// APPROVE (Diagram 3b). Approval sends the task back to work, where the gate checks
+    /// and uses it. A rejection does the same if the step may be skipped (an irreversible
+    /// step the contract lets a person do instead); otherwise the task ends as DECLINED.
+    pub async fn decide_approval(
+        &self,
+        approval_id: &ApprovalId,
+        approver_id: &str,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<TaskRecord, GateError> {
+        let approval = self
+            .store
+            .approval(approval_id)
             .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        let tool = CreateRebalanceDraftTool { store };
-        let target = format!("portfolio:{}", prev.payload.as_of_date.as_str());
-        let idem = format!(
-            "draft:{}:{}",
-            task.task_id,
-            prev.payload.as_of_date.as_str()
-        );
-        ActionGate::evaluate_and_execute(
-            store,
-            &tool,
+            .ok_or_else(|| PreDispatchError::ApprovalNotFound(approval_id.to_string()))?;
+        let mut task = self.task(&approval.task_id).await?;
+        let config = self.config_of(&task).await?;
+        if approver_id == approval.requester_id || approver_id == config.config_admin_id {
+            return Err(PreDispatchError::SeparationOfDutiesViolation(approver_id.into()).into());
+        }
+        if approval.status != ApprovalStatus::Pending {
+            return Err(
+                PreDispatchError::ApprovalNotApproved(approval.status.as_str().into()).into(),
+            );
+        }
+        let expired = self.store.now() >= approval.expires_at_epoch_s;
+        let status = match (approve, expired) {
+            (_, true) => ApprovalStatus::Expired,
+            (true, false) => ApprovalStatus::Approved,
+            (false, false) => ApprovalStatus::Rejected,
+        };
+        self.settle_approval(
             &mut task,
-            &self.config,
-            &Self::mounted_harness_tools(),
-            &target,
-            &prev.payload,
-            &idem,
-            approval_id,
-            0,
-            false,
+            &approval,
+            status,
+            Some(approver_id),
+            note,
+            &config,
+        )
+        .await?;
+        if expired {
+            return Err(PreDispatchError::ApprovalExpired(approval_id.to_string()).into());
+        }
+        Ok(task)
+    }
+
+    async fn settle_approval(
+        &self,
+        task: &mut TaskRecord,
+        approval: &ApprovalRecord,
+        status: ApprovalStatus,
+        approver_id: Option<&str>,
+        note: Option<&str>,
+        config: &TaskTypeConfig,
+    ) -> Result<(), GateError> {
+        let skippable = config.lookup_tool_risk(&approval.tool_name) == Some(RiskTier::R3)
+            && self
+                .contract(&task.task_id)
+                .await?
+                .irreversible_steps_deferred;
+        let next = if status == ApprovalStatus::Approved || skippable {
+            TaskState::Running
+        } else {
+            TaskState::Declined {
+                reason: format!(
+                    "approval_{}:{}",
+                    status.as_str().to_lowercase(),
+                    approval.approval_id
+                ),
+            }
+        };
+        task.transition(next, self.store.now())?;
+        self.store
+            .decide_approval(&approval.approval_id, status, approver_id, note, task)
+            .await
+    }
+
+    /// SETTLE: the requester accepts the delivery.
+    pub async fn confirm_settlement(
+        &self,
+        task_id: &TaskId,
+        confirmer_id: &str,
+        review_minutes: f64,
+    ) -> Result<TaskRecord, GateError> {
+        let mut task = self.task(task_id).await?;
+        task.transition(TaskState::Completed, self.store.now())?;
+        self.store
+            .save(
+                &mut task,
+                &format!("settled_by:{confirmer_id}"),
+                confirmer_id,
+            )
+            .await?;
+        if review_minutes > 0.0 {
+            let cost = CostEntry {
+                stage: "CLOSE".into(),
+                category: "human_review".into(),
+                amount: UsdCents::ZERO,
+                human_minutes: review_minutes,
+                note: confirmer_id.into(),
+            };
+            self.store.record_cost(task_id, &cost).await?;
+        }
+        // ORGANIZE: a lesson for a person to review before it is reused.
+        let lesson = MemoryItem {
+            memory_id: format!("MEM-{task_id}-{}", task.reopened_count),
+            source_task_id: task_id.to_string(),
+            summary: format!(
+                "Settled {} v{} in {} turns, {} reworks, ${:.2} spent",
+                task.task_type,
+                task.config_version,
+                task.turns_used,
+                task.reworks_used,
+                task.spend.to_dollars()
+            ),
+            status: "pending_review".into(),
+            reviewed_by: None,
+        };
+        self.store.add_memory(&lesson).await?;
+        self.task(task_id).await
+    }
+
+    /// The requester disputes the delivery during the settlement window: rework.
+    pub async fn dispute(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+        by: &str,
+    ) -> Result<TaskRecord, GateError> {
+        self.move_to(
+            task_id,
+            TaskState::Running,
+            &format!("disputed:{reason}"),
+            by,
+            |s| matches!(s, TaskState::Settling(_)),
         )
         .await
     }
 
-    /// Submit paper orders (`R3`) through `ActionGate` using DB `approval_id` only!
-    pub async fn execute_paper_orders(
+    /// A later check finds a completed task's outcome wrong.
+    pub async fn reopen(
         &self,
-        store: &DbStore,
-        task_id: &str,
-        draft_id: &str,
-        idempotency_key: &str,
-        approval_id: Option<&str>,
-    ) -> Result<GateOutcome<String>, GateError> {
-        let mut task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        let contract = store
-            .get_contract(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("missing_contract:{task_id}")))?;
-        let draft = store
-            .readback_rebalance_draft(draft_id)
-            .await?
-            .ok_or_else(|| {
-                trade_core::PreDispatchError::BusinessRuleViolation(format!(
-                    "draft_not_found:{draft_id}"
-                ))
-            })?;
-
-        let payload = PortfolioActionPayload {
-            draft_id: draft.draft_id,
-            as_of_date: contract.as_of_date.clone(),
-            weights_bps: draft.weights,
-            markets: contract.universe_markets,
-            portfolio_capital_cents: Some(contract.portfolio_capital),
-        };
-
-        let tool = SubmitPaperOrdersTool {
-            store,
-            broker: &self.broker,
-            vault: &self.vault,
-        };
-        let target = format!("paper_broker:{}", contract.as_of_date.as_str());
-
-        let outcome = ActionGate::evaluate_and_execute(
-            store,
-            &tool,
-            &mut task,
-            &self.config,
-            &Self::mounted_harness_tools(),
-            &target,
-            &payload,
-            idempotency_key,
-            approval_id,
-            0,
-            false,
-        )
-        .await?;
-
-        if let GateOutcome::Executed {
-            receipt,
-            replayed: false,
-            ..
-        } = &outcome
-        {
-            store
-                .record_cost(
-                    task_id,
-                    "paper_execution",
-                    UsdCents::from_cents(1),
-                    0.0,
-                    receipt,
-                )
-                .await?;
-        }
-        Ok(outcome)
-    }
-
-    /// Reconcile `OUTCOME_UNKNOWN` against the standalone `PaperBrokerAdapter` before any retry (`ACT` 4.5).
-    pub async fn reconcile_before_retry(
-        &self,
-        store: &DbStore,
-        task_id: &str,
-        idempotency_key: &str,
-    ) -> Result<ReconcileOutcome, GateError> {
-        let mut task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        if !matches!(task.state(), TaskState::OutcomeUnknown { .. }) {
-            return Ok(ReconcileOutcome {
-                reconciled: false,
-                action_needed: false,
-                receipt_id: None,
-            });
-        }
-
-        if let Some(order) = self.broker.get_order_by_idempotency(idempotency_key) {
-            if let Some(mut intent) = store.get_action_intent(idempotency_key).await? {
-                intent.status = ActionIntentStatus::Verified;
-                intent.backend_receipt_id = Some(order.receipt_id.clone());
-                intent.readback_verified = true;
-                store.update_action_post_dispatch(&intent, None).await?;
-            }
-            task.transition(TaskState::Running)?;
-            store
-                .save_task_optimistic(&mut task, "reconciled_already_filled_at_broker", "reconciler")
-                .await?;
-            return Ok(ReconcileOutcome {
-                reconciled: true,
-                action_needed: false,
-                receipt_id: Some(order.receipt_id),
-            });
-        }
-
-        store.reset_unexecuted_intent_for_retry(idempotency_key).await?;
-        task.retries_used = task.retries_used.saturating_add(1);
-        task.transition(TaskState::Running)?;
-        store
-            .save_task_optimistic(
-                &mut task,
-                "reconciled_not_executed_safe_to_retry",
-                "reconciler",
-            )
-            .await?;
-        Ok(ReconcileOutcome {
-            reconciled: true,
-            action_needed: true,
-            receipt_id: None,
-        })
-    }
-
-    // --- Stage 5: CLOSE (`VERIFYING -> SETTLING -> COMPLETED` or `HANDED_OFF`) ---
-
-    /// Requirement #2: Accepts ONLY `(store, task_id)` — reads all verification basis from DB & Broker!
-    pub async fn verify_and_close(
-        &self,
-        store: &DbStore,
-        task_id: &str,
-    ) -> Result<VerifyOutcome, GateError> {
-        let mut task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        let contract = store.get_contract(task_id).await?;
-        let draft = store.get_latest_draft_for_task(task_id).await?;
-
-        if matches!(
-            task.state(),
-            TaskState::LimitReached { .. }
-                | TaskState::HandedOff(_)
-                | TaskState::OutcomeUnknown { .. }
-        ) {
-            let criteria = self
-                .config
-                .done_criteria
-                .iter()
-                .map(|c| (c.clone(), false))
-                .collect();
-            let next_owner = task
-                .state()
-                .wait_meta()
-                .map(|w| w.owner_id.clone())
-                .unwrap_or_else(|| "human_operator".into());
-            let manifest = DeliveryManifest {
-                task_id: task.task_id.clone(),
-                final_state: task.state().clone(),
-                completeness: if draft.is_some() {
-                    Completeness::Partial
-                } else {
-                    Completeness::Blocked
-                },
-                criteria_results: criteria,
-                assumptions: contract
-                    .as_ref()
-                    .map(|c| c.assumptions.clone())
-                    .unwrap_or_default(),
-                gaps: vec![format!("stopped_in_state:{}", task.state().code())],
-                total_spend: task.spend,
-                next_owner,
-                draft_id: draft.as_ref().map(|d| d.draft_id.clone()),
-                weights: draft.map(|d| d.weights).unwrap_or_default(),
-            };
-            return Ok(VerifyOutcome {
-                manifest,
-                settling_task: None,
-            });
-        }
-
-        task.transition(TaskState::Verifying)?;
-        store
-            .save_task_optimistic(&mut task, "independent_verification_started", "verifier")
-            .await?;
-        store
-            .record_cost(
-                &task.task_id,
-                "independent_verifier",
-                UsdCents::from_cents(1),
-                0.0,
-                "close_verification",
-            )
-            .await?;
-
-        let (passed, criteria, gaps) = self
-            .verifier
-            .verify_from_db(store, &self.broker, task_id)
-            .await?;
-
-        if passed {
-            let verifying_typed = TypedTask::<PhaseFramed>::from_verifying(task)?;
-            let wm = WaitMetadata::new(
-                verifying_typed.record().requester_id.clone(),
-                "2099-12-31T23:59:59Z",
-                "auto_handoff_unconfirmed",
-            )?;
-            let settling = verifying_typed.into_settling(wm)?;
-            let mut rec = settling.into_record();
-            store
-                .save_task_optimistic(
-                    &mut rec,
-                    "verification_passed_entering_settling",
-                    "verifier",
-                )
-                .await?;
-
-            // Reconstruct PhaseSettling with up-to-date DB `version`!
-            let refreshed = store.get_task(task_id).await?.unwrap();
-            let mut to_verifying = TaskRecord::rehydrate_from_db(
-                refreshed.task_id.clone(),
-                refreshed.idempotency_trigger_key.clone(),
-                refreshed.task_type.clone(),
-                refreshed.config_version.clone(),
-                refreshed.requester_id.clone(),
-                refreshed.acting_principal.clone(),
-                refreshed.trigger_source.clone(),
-                refreshed.authorized_markets.clone(),
-                TaskState::Verifying,
-                refreshed.version(),
-                refreshed.turns_used,
-                refreshed.spend,
-                refreshed.retries_used,
-                refreshed.consecutive_denials,
-                refreshed.reworks_used,
-                refreshed.reopened_count,
-            )?;
-            let _ = &mut to_verifying;
-            let wm2 = WaitMetadata::new(
-                refreshed.requester_id.clone(),
-                "2099-12-31T23:59:59Z",
-                "auto_handoff_unconfirmed",
-            )?;
-            let settling_typed =
-                TypedTask::<PhaseFramed>::from_verifying(to_verifying)?.into_settling(wm2)?;
-
-            let manifest = DeliveryManifest {
-                task_id: refreshed.task_id.clone(),
-                final_state: refreshed.state().clone(),
-                completeness: Completeness::Complete,
-                criteria_results: criteria,
-                assumptions: contract.map(|c| c.assumptions).unwrap_or_default(),
-                gaps,
-                total_spend: refreshed.spend,
-                next_owner: refreshed.requester_id,
-                draft_id: draft.as_ref().map(|d| d.draft_id.clone()),
-                weights: draft.map(|d| d.weights).unwrap_or_default(),
-            };
-            Ok(VerifyOutcome {
-                manifest,
-                settling_task: Some(settling_typed),
-            })
-        } else {
-            let wm = WaitMetadata::new(
-                "risk_committee_lead",
-                "2099-12-31T23:59:59Z",
-                "manual_review_required",
-            )?;
-            task.transition(TaskState::HandedOff(wm))?;
-            store
-                .save_task_optimistic(
-                    &mut task,
-                    &format!("verification_failed:{}", gaps.join(",")),
-                    "verifier",
-                )
-                .await?;
-            let manifest = DeliveryManifest {
-                task_id: task.task_id.clone(),
-                final_state: task.state().clone(),
-                completeness: if draft.is_some() {
-                    Completeness::Partial
-                } else {
-                    Completeness::Blocked
-                },
-                criteria_results: criteria,
-                assumptions: contract.map(|c| c.assumptions).unwrap_or_default(),
-                gaps,
-                total_spend: task.spend,
-                next_owner: "risk_committee_lead".into(),
-                draft_id: draft.as_ref().map(|d| d.draft_id.clone()),
-                weights: draft.map(|d| d.weights).unwrap_or_default(),
-            };
-            Ok(VerifyOutcome {
-                manifest,
-                settling_task: None,
-            })
-        }
-    }
-
-    pub async fn confirm_settlement(
-        &self,
-        store: &DbStore,
-        settling_task: TypedTask<PhaseSettling>,
-        confirmer_id: &str,
-        human_review_minutes: f64,
-    ) -> Result<TypedTask<PhaseCompleted>, GateError> {
-        let completed = settling_task.into_completed()?;
-        let mut rec = completed.into_record();
-        store
-            .save_task_optimistic(&mut rec, &format!("settled_by:{confirmer_id}"), confirmer_id)
-            .await?;
-        store
-            .record_cost(
-                &rec.task_id,
-                "human_settlement_review",
-                UsdCents::ZERO,
-                human_review_minutes,
-                confirmer_id,
-            )
-            .await?;
-        store
-            .add_curated_memory(
-                &format!("MEM-{}", rec.task_id),
-                &rec.task_id,
-                &format!(
-                    "Settled {} v{} in {} turns",
-                    rec.task_type, rec.config_version, rec.turns_used
-                ),
-            )
-            .await?;
-
-        // Reconstruct completed handle with updated DB version
-        let settling_tmp = TypedTask::<PhaseFramed>::from_verifying(TaskRecord::rehydrate_from_db(
-            rec.task_id.clone(),
-            rec.idempotency_trigger_key.clone(),
-            rec.task_type.clone(),
-            rec.config_version.clone(),
-            rec.requester_id.clone(),
-            rec.acting_principal.clone(),
-            rec.trigger_source.clone(),
-            rec.authorized_markets.clone(),
-            TaskState::Verifying,
-            rec.version(),
-            rec.turns_used,
-            rec.spend,
-            rec.retries_used,
-            rec.consecutive_denials,
-            rec.reworks_used,
-            rec.reopened_count,
-        )?)?
-        .into_settling(WaitMetadata::new("done", "2099-12-31T23:59:59Z", "none")?)?;
-        Ok(settling_tmp.into_completed()?)
-    }
-
-    pub async fn reopen_task(
-        &self,
-        store: &DbStore,
-        task_id: &str,
+        task_id: &TaskId,
         reason: &str,
-        actor: &str,
+        by: &str,
     ) -> Result<TaskRecord, GateError> {
-        let mut task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        task.transition(TaskState::Running)?;
-        store
-            .save_task_optimistic(&mut task, &format!("reopened:{reason}"), actor)
-            .await?;
+        self.move_to(
+            task_id,
+            TaskState::Running,
+            &format!("reopened:{reason}"),
+            by,
+            |s| matches!(s, TaskState::Completed),
+        )
+        .await
+    }
+
+    /// A person answered and hands the task back to the agent.
+    pub async fn hand_back(&self, task_id: &TaskId, by: &str) -> Result<TaskRecord, GateError> {
+        self.move_to(task_id, TaskState::Running, "handed_back", by, |s| {
+            matches!(s, TaskState::HandedOff(_))
+        })
+        .await
+    }
+
+    pub async fn cancel(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+        by: &str,
+    ) -> Result<TaskRecord, GateError> {
+        let state = TaskState::Cancelled {
+            reason: reason.into(),
+        };
+        self.move_to(task_id, state, "cancelled", by, |_| true)
+            .await
+    }
+
+    async fn move_to(
+        &self,
+        task_id: &TaskId,
+        next: TaskState,
+        reason: &str,
+        by: &str,
+        allowed_from: impl Fn(&TaskState) -> bool,
+    ) -> Result<TaskRecord, GateError> {
+        let mut task = self.task(task_id).await?;
+        if !allowed_from(task.state()) {
+            return Err(not_now(&task, next.code()));
+        }
+        task.transition(next, self.store.now())?;
+        self.store.save(&mut task, reason, by).await?;
         Ok(task)
     }
 
-    pub async fn create_handoff_package(
-        &self,
-        store: &DbStore,
-        task_id: &str,
-        original_request: &str,
-        trigger_reason: &str,
-        partial_weights: BTreeMap<String, WeightBps>,
-        open_questions: Vec<String>,
-    ) -> Result<HandoffPackage, GateError> {
-        let task = store
-            .get_task(task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{task_id}")))?;
-        let actions = store.list_task_actions(task_id).await?;
-        let completed_actions = actions
+    /// ESCALATE: give the task to a person, with what was done and what is open.
+    pub async fn hand_off(&self, task_id: &TaskId, reason: &str) -> Result<Step, GateError> {
+        let mut task = self.task(task_id).await?;
+        let config = self.config_of(&task).await?;
+        let owner = config.waits.escalation_owner_id.clone();
+        let actions = self.store.actions(task_id).await?;
+        let (done, open): (Vec<_>, Vec<_>) = actions
             .iter()
-            .filter(|a| a.readback_verified)
-            .map(|a| format!("{}:{}:{}", a.tool_name, a.idempotency_key, a.status.as_str()))
-            .collect();
-        let pending_actions = actions
-            .iter()
-            .filter(|a| !a.readback_verified)
-            .map(|a| format!("{}:{}:{}", a.tool_name, a.idempotency_key, a.status.as_str()))
-            .collect();
-
-        Ok(HandoffPackage {
-            task_id: task.task_id,
-            requester_id: task.requester_id,
-            original_request: original_request.into(),
-            trigger_reason: trigger_reason.into(),
-            completed_actions,
-            pending_actions,
-            partial_weights,
-            open_questions,
-            assigned_human_owner: None,
+            .partition(|a| a.status == ActionIntentStatus::Verified);
+        let describe = |a: &&ActionIntentRecord| {
+            format!(
+                "{}:{}:{}",
+                a.tool_name,
+                a.idempotency_key,
+                a.status.as_str()
+            )
+        };
+        let package = HandoffPackage {
+            task_id: task.task_id.clone(),
+            requester_id: task.requester_id.clone(),
+            original_request: self
+                .store
+                .contract(task_id)
+                .await?
+                .map(|c| c.goal)
+                .unwrap_or_default(),
+            trigger_reason: reason.into(),
+            completed_actions: done.iter().map(describe).collect(),
+            pending_actions: open.iter().map(describe).collect(),
+            partial_weights: self
+                .store
+                .latest_draft(task_id)
+                .await?
+                .map(|d| d.weights)
+                .unwrap_or_default(),
+            open_questions: vec![reason.into()],
+            assigned_human_owner: Some(owner.clone()),
             accepted_by_human: false,
-        })
+        };
+        let now = self.store.now();
+        let wait = WaitMetadata::new(
+            &owner,
+            now + config.waits.handoff_ack_ttl_s,
+            TimeoutAction::Escalate,
+        )?;
+        task.transition(TaskState::HandedOff(wait), now)?;
+        self.store.hand_off(&package, &mut task).await?;
+        Ok(Step::HandedOff(owner))
     }
 
-    pub async fn confirm_handoff(
-        &self,
-        store: &DbStore,
-        mut pkg: HandoffPackage,
-        human_owner_id: &str,
-    ) -> Result<HandoffPackage, GateError> {
-        let mut task = store
-            .get_task(&pkg.task_id)
-            .await?
-            .ok_or_else(|| GateError::Storage(format!("unknown_task:{}", pkg.task_id)))?;
-        pkg.assigned_human_owner = Some(human_owner_id.into());
-        pkg.accepted_by_human = true;
-        let wm = WaitMetadata::new(
-            human_owner_id,
-            "2099-12-31T23:59:59Z",
-            "human_owner_follow_up",
-        )?;
-        if !matches!(task.state(), TaskState::HandedOff(_)) {
-            task.transition(TaskState::HandedOff(wm))?;
+    // ---- Deadlines and recovery ----------------------------------------------------------
+
+    /// Act on every wait whose deadline has passed. A timeout is never a silent approval:
+    /// an unanswered question goes to a person, an unanswered approval counts as refused,
+    /// an undisputed delivery completes, and an unclaimed hand-off goes to the next owner.
+    /// Returns how many waits were handled.
+    pub async fn sweep(&self) -> Result<usize, GateError> {
+        let due = self.store.due_waits(self.store.now()).await?;
+        for task in &due {
+            match self.expire(task.clone()).await {
+                // Someone acted between the query and now; their action stands.
+                Ok(()) | Err(GateError::Conflict(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
-        store
-            .save_task_optimistic(
-                &mut task,
-                &format!("handoff_accepted:{human_owner_id}"),
-                human_owner_id,
-            )
-            .await?;
-        Ok(pkg)
+        Ok(due.len())
+    }
+
+    async fn expire(&self, mut task: TaskRecord) -> Result<(), GateError> {
+        let config = self.config_of(&task).await?;
+        let now = self.store.now();
+        match task.state().clone() {
+            TaskState::AwaitingInput(_) => {
+                self.hand_off(&task.task_id, "no_answer_before_deadline")
+                    .await?;
+            }
+            TaskState::AwaitingApproval(_) => {
+                let pending = self
+                    .store
+                    .task_approvals(&task.task_id)
+                    .await?
+                    .into_iter()
+                    .find(|a| a.status == ApprovalStatus::Pending);
+                match pending {
+                    Some(approval) => {
+                        let note = Some("deadline_passed");
+                        self.settle_approval(
+                            &mut task,
+                            &approval,
+                            ApprovalStatus::Expired,
+                            None,
+                            note,
+                            &config,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        self.hand_off(&task.task_id, "awaiting_unknown_approval")
+                            .await?;
+                    }
+                }
+            }
+            TaskState::Settling(_) => {
+                self.confirm_settlement(&task.task_id, "settlement_window", 0.0)
+                    .await?;
+            }
+            TaskState::HandedOff(wait) => {
+                let waits = &config.waits;
+                // Unclaimed: first the backup owner, then keep reminding them.
+                task.reassign_wait(&waits.backup_owner_id, now + waits.handoff_ack_ttl_s)?;
+                let reason = format!("handoff_unclaimed_by:{}", wait.owner_id);
+                self.store.save(&mut task, &reason, "sweeper").await?;
+            }
+            other => return Err(not_now(&task, other.code())),
+        }
+        Ok(())
+    }
+
+    /// Diagram 4b: settle the task's unsettled actions by reading the target systems.
+    /// Returns `false` if one could not be settled, which needs a person.
+    pub async fn reconcile(&self, task_id: &TaskId) -> Result<bool, GateError> {
+        let unsettled: Vec<_> = self
+            .store
+            .unsettled_actions()
+            .await?
+            .into_iter()
+            .filter(|a| &a.task_id == task_id)
+            .collect();
+        for action in &unsettled {
+            let result = match action.tool_name.as_str() {
+                DRAFT_TOOL => self.draft_tool().reconcile(action).await?,
+                ORDER_TOOL => self.order_tool().reconcile(action).await?,
+                other => DispatchResult::Unknown {
+                    receipt_id: None,
+                    detail: format!("no_reconciler_for:{other}"),
+                },
+            };
+            if matches!(result, DispatchResult::Unknown { .. }) {
+                return Ok(false);
+            }
+            let mut task = self.task(task_id).await?;
+            if matches!(task.state(), TaskState::OutcomeUnknown { .. }) {
+                task.transition(TaskState::Running, self.store.now())?;
+            }
+            self.store
+                .reconcile(&action.idempotency_key, &result, &mut task, "reconciler")
+                .await?;
+        }
+        Ok(true)
+    }
+
+    /// At start-up: whatever was in flight when the process stopped is settled now, or
+    /// handed to a person. Assumes this is the only process running tasks.
+    pub async fn recover(&self) -> Result<Vec<TaskId>, GateError> {
+        let tasks: BTreeSet<TaskId> = self
+            .store
+            .unsettled_actions()
+            .await?
+            .into_iter()
+            .map(|a| a.task_id)
+            .collect();
+        for task_id in &tasks {
+            if !self.reconcile(task_id).await? {
+                self.hand_off(task_id, "outcome_unknown_at_restart").await?;
+            }
+        }
+        Ok(tasks.into_iter().collect())
+    }
+}
+
+fn refused(approvals: &[ApprovalRecord], tool: &str) -> bool {
+    approvals.iter().any(|a| {
+        a.tool_name == tool
+            && matches!(a.status, ApprovalStatus::Rejected | ApprovalStatus::Expired)
+    })
+}
+
+/// What a gate result means for the loop: carry on, stop for a person, or report a denial.
+fn gated(result: Result<GateOutcome, GateError>, tool: &str) -> Result<Option<Step>, GateError> {
+    match result {
+        Ok(GateOutcome::Executed { .. }) => Ok(None),
+        Ok(GateOutcome::NeedsApproval { approval_id, .. }) => Ok(Some(Step::NeedsApproval {
+            approval_id,
+            tool: tool.into(),
+        })),
+        // The gate moved the task to LIMIT_REACHED; the next round closes it.
+        Err(GateError::PreDispatch(PreDispatchError::LimitReached(_))) => Ok(None),
+        Err(GateError::PreDispatch(reason)) => Ok(Some(Step::Denied(reason.code()))),
+        // Not sent: the next round retries, within the retry limit. Unknown outcome: the
+        // next round reconciles. Conflict: the next round reads again.
+        Err(
+            GateError::NotSent(_) | GateError::PostDispatchUnknown { .. } | GateError::Conflict(_),
+        ) => Ok(None),
+        Err(other) => Err(other),
     }
 }

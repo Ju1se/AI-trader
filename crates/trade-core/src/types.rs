@@ -37,7 +37,9 @@ pub fn require_non_empty(val: &str, field: &str) -> Result<(), SchemaError> {
 pub fn validate_iso_date(s: &str, field: &str) -> Result<(), SchemaError> {
     let bytes = s.as_bytes();
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
-        return Err(SchemaError(format!("{field} must be YYYY-MM-DD, got {s:?}")));
+        return Err(SchemaError(format!(
+            "{field} must be YYYY-MM-DD, got {s:?}"
+        )));
     }
     for (idx, &b) in bytes.iter().enumerate() {
         if idx != 4 && idx != 7 && !b.is_ascii_digit() {
@@ -119,7 +121,9 @@ impl WeightBps {
 
     pub fn new(bps: u16) -> Result<Self, SchemaError> {
         if bps > Self::MAX {
-            return Err(SchemaError(format!("WeightBps {bps} exceeds 10_000 (100%)")));
+            return Err(SchemaError(format!(
+                "WeightBps {bps} exceeds 10_000 (100%)"
+            )));
         }
         Ok(Self(bps))
     }

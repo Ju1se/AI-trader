@@ -1,845 +1,567 @@
 #![forbid(unsafe_code)]
-//! Generic 9-step fixed-order `ActionGate` depending ONLY on `trade-core`.
-//! - Zero hardcoded tool names: interacts with concrete tools strictly via the `Tool` trait.
-//! - Unconfigured tools are rejected (`ToolNotConfigured`); `R4` is permanently prohibited (`R4PermanentlyProhibited`).
-//! - Approvals are DB-backed (`approval_id` only; atomic consumption + `DISPATCHED` intent commit).
-//! - Any error after `DISPATCHED` transitions the task to `OUTCOME_UNKNOWN` (`GateError::PostDispatchUnknown`).
+//! The action gate of Diagram 3a.
+//!
+//! `decide` is a pure function of a request and a context that the store read in one go.
+//! `run` is the thin shell around it: load, decide, write the verdict in one transaction
+//! guarded by the task's version, execute, read back, record. Nothing holds a borrow of the
+//! task across an `.await`; if someone changes the task in between, the write fails with
+//! `GateError::Conflict` and `run` reads again and decides again. That retry only happens
+//! before the request leaves, so an action is never sent twice.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 
 use trade_core::{
-    detect_prompt_injection, sha256_hex, ActionIntentRecord, ActionIntentStatus, AutonomyLevel,
-    GateError, PreDispatchError, RiskTier, TaskRecord, TaskState, TaskTypeConfig, WaitMetadata,
+    ActionIntentRecord, ActionIntentStatus, ApprovalId, ApprovalRecord, ApprovalStatus,
+    AutonomyLevel, ExecError, GateError, IdempotencyKey, PreDispatchError, RiskTier, TaskId,
+    TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, WaitMetadata, detect_prompt_injection,
+    sha256_hex,
 };
 
-/// Unforgeable compile-time capability proof that steps 1..=8 of `ActionGate` succeeded.
-/// Concrete `Tool::execute` implementations require `&VerifiedGateTicket`.
-pub struct VerifiedGateTicket {
-    _private: (),
+/// Proof that the gate allowed this execution. Only this crate can create one, so a tool's
+/// side effect cannot be triggered from outside the gate.
+pub struct VerifiedGateTicket(());
+
+/// One proposed tool call. The task and the idempotency key come from the harness, never
+/// from the model.
+#[derive(Debug, Clone)]
+pub struct GateRequest<A> {
+    pub task_id: TaskId,
+    pub target: String,
+    pub args: A,
+    pub idempotency_key: IdempotencyKey,
+    pub approval_id: Option<ApprovalId>,
 }
 
-impl VerifiedGateTicket {
-    fn mint() -> Self {
-        Self { _private: () }
-    }
+/// Everything `decide` looks at, read from the store in one go. Nothing in it comes from
+/// the proposer.
+#[derive(Debug, Clone)]
+pub struct GateContext {
+    pub task: TaskRecord,
+    pub config: TaskTypeConfig,
+    /// The approval the request names, if any.
+    pub approval: Option<ApprovalRecord>,
+    /// The action already registered under the request's idempotency key, if any.
+    pub existing_intent: Option<ActionIntentRecord>,
+    /// Any action of this task that was dispatched and not yet settled.
+    pub unresolved_intent: Option<IdempotencyKey>,
+    pub now_epoch_s: i64,
 }
 
-/// Abstract persistence ledger implemented by `trade-store`.
-pub trait GateLedger {
-    fn save_task(
-        &self,
-        task: &mut TaskRecord,
-        reason: &str,
-        actor: &str,
-    ) -> impl Future<Output = Result<(), GateError>>;
-
-    fn get_action_intent(
-        &self,
-        idempotency_key: &str,
-    ) -> impl Future<Output = Result<Option<ActionIntentRecord>, GateError>>;
-
-    fn create_pending_approval(
-        &self,
-        task_id: &str,
-        requester_id: &str,
-        tool_name: &str,
-        target: &str,
-        payload_hash: &str,
-        canonical_args: &str,
-    ) -> impl Future<Output = Result<String, GateError>>;
-
-    /// Atomically verifies `approval_id` (if `Some`: status == APPROVED, hash, expiry, separation of duties),
-    /// marks the approval `CONSUMED` in the same DB transaction, and writes `ActionIntentStatus::Dispatched`!
-    fn consume_approval_and_mark_dispatched(
-        &self,
-        approval_id: Option<&str>,
-        task: &TaskRecord,
-        config: &TaskTypeConfig,
-        intent: &ActionIntentRecord,
-    ) -> impl Future<Output = Result<(), GateError>>;
-
-    fn update_action_post_dispatch(
-        &self,
-        intent: &ActionIntentRecord,
-        approval_id: Option<&str>,
-    ) -> impl Future<Output = Result<(), GateError>>;
-}
-
-/// Generic governed tool interface (`Requirement #2`: risk tier, arg validation, execution, readback).
-pub trait Tool {
-    type Args;
-    type Receipt: AsRef<str> + Clone;
-
-    fn name(&self) -> &str;
-    fn risk_tier(&self) -> RiskTier;
-    fn canonical_args_json(&self, args: &Self::Args) -> Result<String, PreDispatchError>;
-    fn validate_args(&self, args: &Self::Args, task: &TaskRecord) -> Result<(), PreDispatchError>;
-    fn check_business_rules(
-        &self,
-        args: &Self::Args,
-        task: &TaskRecord,
-    ) -> impl Future<Output = Result<(), PreDispatchError>>;
-    fn check_pre_dispatch_ready(&self) -> Result<(), PreDispatchError> {
-        Ok(())
-    }
-    fn execute(
-        &self,
-        ticket: &VerifiedGateTicket,
-        task_id: &str,
-        idempotency_key: &str,
-        args: &Self::Args,
-    ) -> impl Future<Output = Result<Self::Receipt, String>>;
-    fn readback_verify(
-        &self,
-        args: &Self::Args,
-        receipt: &Self::Receipt,
-    ) -> impl Future<Output = Result<bool, String>>;
-    fn rehydrate_verified_receipt(
-        &self,
-        receipt_id: &str,
-    ) -> impl Future<Output = Result<Option<Self::Receipt>, String>>;
+/// An allowed action, ready to be registered and sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dispatch {
+    pub tier: RiskTier,
+    pub canonical_args: String,
+    pub payload_hash: String,
+    /// The approval this dispatch uses up, when it needed one.
+    pub approval_id: Option<ApprovalId>,
+    /// Sending again an action that never left counts as a retry.
+    pub is_retry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GateOutcome<R> {
+pub enum Verdict {
+    Proceed(Dispatch),
+    NeedsApproval(Dispatch),
+    /// The same action already ran and was verified; nothing is sent again.
+    Replay {
+        receipt_id: String,
+        payload_hash: String,
+    },
+    /// Step 1: a limit is used up. The task moves to LIMIT_REACHED.
+    Limit(String),
+    /// Step 1: the task is frozen or not running. Not the proposer's fault, not counted.
+    Stop(PreDispatchError),
+    /// Refused. The reason goes back to the proposer as data and counts as a denial.
+    Deny(PreDispatchError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateOutcome {
     Executed {
-        receipt: R,
-        idempotency_key: String,
+        receipt_id: String,
         payload_hash: String,
         replayed: bool,
     },
     NeedsApproval {
-        approval_id: String,
+        approval_id: ApprovalId,
         payload_hash: String,
-        risk_tier: RiskTier,
     },
 }
 
-fn compute_generic_payload_hash(tool_name: &str, target: &str, canonical_args: &str) -> String {
-    let envelope = format!("{tool_name}|{target}|{canonical_args}");
-    sha256_hex(envelope.as_bytes())
+/// What happened after the intent was marked DISPATCHED.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchResult {
+    Verified {
+        receipt_id: String,
+    },
+    /// The request never left: the intent is marked FAILED and the task keeps running.
+    NotSent {
+        detail: String,
+    },
+    /// It may have happened: the intent is UNKNOWN and the task goes to OUTCOME_UNKNOWN.
+    Unknown {
+        receipt_id: Option<String>,
+        detail: String,
+    },
 }
 
-pub struct ActionGate;
+/// An approval request for the store to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewApproval {
+    pub tool_name: String,
+    pub target: String,
+    pub payload_hash: String,
+    pub args_json: String,
+    pub expires_at_epoch_s: i64,
+}
 
-impl ActionGate {
-    async fn record_denial<L: GateLedger>(
-        ledger: &L,
-        task: &mut TaskRecord,
-        err: PreDispatchError,
-    ) -> GateError {
-        task.consecutive_denials = task.consecutive_denials.saturating_add(1);
-        let reason = format!("gate_denied:{}", err.code());
-        if let Err(save_err) = ledger.save_task(task, &reason, "action_gate").await {
-            return save_err;
-        }
-        GateError::PreDispatch(err)
+/// The persistence the gate needs. `trade-store` implements it; each method is one
+/// transaction.
+pub trait GateLedger {
+    /// Read the task and everything else `decide` needs. Fails if the task does not exist.
+    fn load_context(
+        &self,
+        task_id: &TaskId,
+        key: &IdempotencyKey,
+        approval_id: Option<&ApprovalId>,
+    ) -> impl Future<Output = Result<GateContext, GateError>>;
+
+    /// Write `task` if the stored version still equals `task.version()`, otherwise fail
+    /// with `GateError::Conflict`.
+    fn save_task(
+        &self,
+        task: &TaskRecord,
+        reason: &str,
+    ) -> impl Future<Output = Result<(), GateError>>;
+
+    /// Count a denied proposal (one turn and one consecutive denial) and log the reason.
+    /// The state does not change.
+    fn record_denial(
+        &self,
+        task_id: &TaskId,
+        reason: &PreDispatchError,
+    ) -> impl Future<Output = Result<(), GateError>>;
+
+    /// Create a pending approval and save `task`, now AWAITING_APPROVAL, together.
+    fn request_approval(
+        &self,
+        task: &TaskRecord,
+        approval: &NewApproval,
+    ) -> impl Future<Output = Result<ApprovalId, GateError>>;
+
+    /// In one transaction: use up the approval if it is still APPROVED for this payload,
+    /// register the intent as DISPATCHED, and save `task`. If any part fails, none happens.
+    fn begin_dispatch(
+        &self,
+        task: &TaskRecord,
+        approval_id: Option<&ApprovalId>,
+        intent: &ActionIntentRecord,
+    ) -> impl Future<Output = Result<(), GateError>>;
+
+    /// Record what happened after dispatch. `Verified` also clears the consecutive-denial
+    /// count. `NotSent` gives back the approval the action used, since nothing was sent.
+    /// `Unknown` also moves the task to OUTCOME_UNKNOWN, whatever its version is now.
+    fn finish_dispatch(
+        &self,
+        task_id: &TaskId,
+        key: &IdempotencyKey,
+        result: &DispatchResult,
+    ) -> impl Future<Output = Result<(), GateError>>;
+}
+
+/// A governed tool. `decide` uses only the pure methods; `load_facts`, `execute` and
+/// `readback` are the ones with effects.
+pub trait Tool {
+    type Args;
+    /// What the business rules are checked against, such as the stored veto list.
+    type Facts;
+
+    fn name(&self) -> &str;
+    /// The lowest tier this tool may run at. Configuration can raise it, never lower it.
+    fn min_tier(&self) -> RiskTier;
+    /// Canonical JSON of the arguments, which the approval hash covers. An error means
+    /// the arguments are malformed.
+    fn canonical_args(&self, args: &Self::Args) -> Result<String, PreDispatchError>;
+    /// Read what `check` needs, from the store or the target system.
+    fn load_facts(
+        &self,
+        task: &TaskRecord,
+        args: &Self::Args,
+    ) -> impl Future<Output = Result<Self::Facts, GateError>>;
+    /// Scope and business rules. Pure.
+    fn check(
+        &self,
+        args: &Self::Args,
+        task: &TaskRecord,
+        facts: &Self::Facts,
+    ) -> Result<(), PreDispatchError>;
+    /// The side effect. Returns the target system's receipt ID.
+    fn execute(
+        &self,
+        ticket: &VerifiedGateTicket,
+        task_id: &TaskId,
+        key: &IdempotencyKey,
+        args: &Self::Args,
+    ) -> impl Future<Output = Result<String, ExecError>>;
+    /// Read the target system independently. `Ok` only if it shows exactly what was asked.
+    fn readback(
+        &self,
+        args: &Self::Args,
+        receipt_id: &str,
+    ) -> impl Future<Output = Result<(), String>>;
+}
+
+pub fn payload_hash(tool: &str, target: &str, canonical_args: &str) -> String {
+    sha256_hex(format!("{tool}|{target}|{canonical_args}").as_bytes())
+}
+
+/// Diagram 3a in its fixed order. Every refusal comes before any request for approval.
+pub fn decide<T: Tool>(
+    tool: &T,
+    req: &GateRequest<T::Args>,
+    ctx: &GateContext,
+    facts: &T::Facts,
+) -> Verdict {
+    match evaluate(tool, req, ctx, facts) {
+        Ok(verdict) | Err(verdict) => verdict,
+    }
+}
+
+/// `Err` carries an early verdict, so each step can end the evaluation with `?`.
+fn evaluate<T: Tool>(
+    tool: &T,
+    req: &GateRequest<T::Args>,
+    ctx: &GateContext,
+    facts: &T::Facts,
+) -> Result<Verdict, Verdict> {
+    use PreDispatchError as E;
+    use Verdict::{Deny, Stop};
+    let (task, config, name) = (&ctx.task, &ctx.config, tool.name());
+
+    // 0. The tool is in this task type's configuration.
+    let tier = config
+        .lookup_tool_risk(name)
+        .ok_or_else(|| Deny(E::ToolNotConfigured(name.into())))?
+        .max(tool.min_tier());
+
+    // 1. The task is running, not frozen, and within every limit.
+    if let TaskState::OutcomeUnknown { frozen_action_key } = task.state() {
+        return Err(Stop(E::TaskFrozenOutcomeUnknown(
+            frozen_action_key.to_string(),
+        )));
+    }
+    if let Some(key) = &ctx.unresolved_intent {
+        return Err(Stop(E::UnreconciledIntentExists(key.to_string())));
+    }
+    if !matches!(task.state(), TaskState::Running) {
+        return Err(Stop(E::TaskNotActive(task.state().code().into())));
+    }
+    let is_retry = ctx
+        .existing_intent
+        .as_ref()
+        .is_some_and(|intent| intent.status == ActionIntentStatus::Failed);
+    if let Some(limit) = used_up_limit(task, config, ctx.now_epoch_s, is_retry) {
+        return Err(Verdict::Limit(limit.into()));
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn evaluate_and_execute<L, T>(
-        ledger: &L,
-        tool: &T,
-        task: &mut TaskRecord,
-        config: &TaskTypeConfig,
-        mounted_tools: &BTreeSet<String>,
-        target: &str,
-        args: &T::Args,
-        idempotency_key: &str,
-        approval_id: Option<&str>,
-        wall_elapsed_ms: u64,
-        is_close_phase: bool,
-    ) -> Result<GateOutcome<T::Receipt>, GateError>
-    where
-        L: GateLedger,
-        T: Tool,
-    {
-        let tool_name = tool.name();
+    // 2. The arguments are well formed.
+    if req.target.trim().is_empty() {
+        return Err(Deny(E::InvalidArguments("empty_target".into())));
+    }
+    let canonical_args = tool.canonical_args(&req.args).map_err(Deny)?;
 
-        // 1. Config Risk Lookup & R4 Permanent Prohibition (Diagram 3a) + Mount Check
-        let Some(cfg_tier) = config.lookup_tool_risk(tool_name) else {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::ToolNotConfigured(tool_name.into()),
-            )
-            .await);
-        };
-        let risk_tier = cfg_tier.max(tool.risk_tier());
-        if risk_tier == RiskTier::R4 {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::R4PermanentlyProhibited(tool_name.into()),
-            )
-            .await);
-        }
-        if !mounted_tools.contains(tool_name) {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::ToolUnmounted(tool_name.into()),
-            )
-            .await);
-        }
+    // 3. Hard denials: never allowed, or text trying to steer the system.
+    if tier == RiskTier::R4 {
+        return Err(Deny(E::R4PermanentlyProhibited(name.into())));
+    }
+    if detect_prompt_injection(&req.target) || detect_prompt_injection(&canonical_args) {
+        return Err(Deny(E::PromptInjectionDetected(name.into())));
+    }
 
-        // 2. OutcomeUnknown Freeze & Budget/Safety Limits
-        if let TaskState::OutcomeUnknown { frozen_action_key } = task.state() {
-            let k = frozen_action_key.clone();
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::TaskFrozenOutcomeUnknown(k),
-            )
-            .await);
-        }
+    // 4. Permission: what this task type's autonomy level allows.
+    let blocked = match (config.autonomy_level, tier) {
+        (AutonomyLevel::Shadow, RiskTier::R2 | RiskTier::R3) => Some("shadow_blocks_writes"),
+        (AutonomyLevel::DraftOnly, RiskTier::R3) => Some("draft_only_blocks_r3"),
+        _ => None,
+    };
+    if let Some(why) = blocked {
+        return Err(Deny(E::AutonomyModeBlocked(why.into())));
+    }
 
-        let lim = &config.budget_limits;
-        let spend_cap = if is_close_phase {
-            lim.max_spend
-        } else {
-            lim.usable_execution_spend()
-        };
-        if task.turns_used >= lim.max_turns
-            || task.spend >= spend_cap
-            || wall_elapsed_ms > lim.max_wall_ms
-            || task.retries_used > lim.max_retries
-            || task.consecutive_denials >= lim.max_consecutive_denials
-            || task.reworks_used > lim.max_reworks
-        {
-            if !matches!(task.state(), TaskState::LimitReached { .. }) {
-                task.transition(TaskState::LimitReached {
-                    reason: "budget_or_safety_limit_reached".into(),
-                })?;
-                ledger
-                    .save_task(task, "limit_reached", "action_gate")
-                    .await?;
+    // 5. Scope and business rules, checked against facts from the store.
+    tool.check(&req.args, task, facts).map_err(Deny)?;
+
+    // 7a. An action already registered under this key is replayed or refused, never sent
+    // again. Checked before approval so that a replay does not ask for a second approval.
+    let payload_hash = payload_hash(name, &req.target, &canonical_args);
+    if let Some(intent) = &ctx.existing_intent {
+        let key = || req.idempotency_key.to_string();
+        match (&intent.status, &intent.backend_receipt_id) {
+            _ if intent.payload_hash != payload_hash => {
+                return Err(Deny(E::IdempotencyKeyReused(key())));
             }
-            return Err(GateError::PreDispatch(PreDispatchError::LimitReached(
-                "budget_or_safety_limit_reached".into(),
-            )));
-        }
-
-        // 3. Argument Schema Validation
-        if let Err(e) = tool.validate_args(args, task) {
-            return Err(Self::record_denial(ledger, task, e).await);
-        }
-
-        // 4. Hard Deny & Prompt Injection Guard
-        if target.trim().is_empty() {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::InvalidArguments("empty_target".into()),
-            )
-            .await);
-        }
-        let canonical_args = match tool.canonical_args_json(args) {
-            Ok(s) => s,
-            Err(e) => return Err(Self::record_denial(ledger, task, e).await),
-        };
-        if detect_prompt_injection(target) || detect_prompt_injection(&canonical_args) {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::PromptInjectionDetected(tool_name.into()),
-            )
-            .await);
-        }
-
-        // 5 & 6. Scope, Authoritative DB Business Rules & Pre-Dispatch Readiness
-        if let Err(e) = tool.check_business_rules(args, task).await {
-            return Err(Self::record_denial(ledger, task, e).await);
-        }
-        if let Err(e) = tool.check_pre_dispatch_ready() {
-            return Err(Self::record_denial(ledger, task, e).await);
-        }
-
-        // 7. Progressive Autonomy & DB-Backed Approval Lifecycle
-        let payload_hash = compute_generic_payload_hash(tool_name, target, &canonical_args);
-
-        if config.autonomy_level == AutonomyLevel::Shadow
-            && matches!(risk_tier, RiskTier::R2 | RiskTier::R3)
-        {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::AutonomyModeBlocked("shadow_mode_blocks_writes".into()),
-            )
-            .await);
-        }
-        if config.autonomy_level == AutonomyLevel::DraftOnly && risk_tier == RiskTier::R3 {
-            return Err(Self::record_denial(
-                ledger,
-                task,
-                PreDispatchError::AutonomyModeBlocked("draft_only_blocks_r3_execution".into()),
-            )
-            .await);
-        }
-
-        // Check existing intent for exact verified idempotent replay or unreconciled state
-        if let Some(existing) = ledger.get_action_intent(idempotency_key).await? {
-            if existing.status == ActionIntentStatus::Verified
-                && existing.readback_verified
-                && existing.payload_hash == payload_hash
-            {
-                if let Some(rid) = &existing.backend_receipt_id {
-                    if let Ok(Some(rehydrated)) = tool.rehydrate_verified_receipt(rid).await {
-                        return Ok(GateOutcome::Executed {
-                            receipt: rehydrated,
-                            idempotency_key: idempotency_key.to_string(),
-                            payload_hash,
-                            replayed: true,
-                        });
-                    }
-                }
-            }
-            if matches!(
-                existing.status,
-                ActionIntentStatus::Unknown | ActionIntentStatus::Dispatched
-            ) {
-                return Err(Self::record_denial(
-                    ledger,
-                    task,
-                    PreDispatchError::UnreconciledIntentExists(idempotency_key.into()),
-                )
-                .await);
-            }
-        }
-
-        let needs_approval = risk_tier == RiskTier::R3
-            || (config.autonomy_level == AutonomyLevel::PerActionApproval
-                && risk_tier == RiskTier::R2);
-
-        if needs_approval && approval_id.is_none() {
-            let created_id = ledger
-                .create_pending_approval(
-                    &task.task_id,
-                    &task.requester_id,
-                    tool_name,
-                    target,
-                    &payload_hash,
-                    &canonical_args,
-                )
-                .await?;
-            if !matches!(task.state(), TaskState::AwaitingApproval(_)) {
-                let wm = WaitMetadata::new(
-                    "portfolio_approver",
-                    "2099-12-31T23:59:59Z",
-                    "expire_and_decline",
-                )?;
-                task.transition(TaskState::AwaitingApproval(wm))?;
-                ledger
-                    .save_task(
-                        task,
-                        &format!("pending_approval:{created_id}"),
-                        "action_gate",
-                    )
-                    .await?;
-            }
-            return Ok(GateOutcome::NeedsApproval {
-                approval_id: created_id,
-                payload_hash,
-                risk_tier,
-            });
-        }
-
-        // 8. Atomic DB Approval Verification/Consumption + Pre-Dispatch Intent (`DISPATCHED`)
-        let mut intent = ActionIntentRecord {
-            idempotency_key: idempotency_key.to_string(),
-            task_id: task.task_id.clone(),
-            tool_name: tool_name.to_string(),
-            target: target.to_string(),
-            args_json: canonical_args,
-            payload_hash: payload_hash.clone(),
-            status: ActionIntentStatus::Dispatched,
-            backend_receipt_id: None,
-            readback_verified: false,
-        };
-
-        let effective_approval_id = if needs_approval { approval_id } else { None };
-        match ledger
-            .consume_approval_and_mark_dispatched(effective_approval_id, task, config, &intent)
-            .await
-        {
-            Ok(()) => {}
-            Err(GateError::PreDispatch(PreDispatchError::ApprovalRejected(aid))) => {
-                task.consecutive_denials = task.consecutive_denials.saturating_add(1);
-                if matches!(
-                    task.state(),
-                    TaskState::AwaitingApproval(_) | TaskState::Running
-                ) {
-                    task.transition(TaskState::Declined {
-                        reason: format!("approval_rejected:{aid}"),
-                    })?;
-                }
-                ledger
-                    .save_task(task, &format!("approval_rejected:{aid}"), "action_gate")
-                    .await?;
-                return Err(GateError::PreDispatch(PreDispatchError::ApprovalRejected(
-                    aid,
-                )));
-            }
-            Err(GateError::PreDispatch(pre_err)) => {
-                return Err(Self::record_denial(ledger, task, pre_err).await);
-            }
-            Err(other) => return Err(other),
-        }
-
-        // Transition AWAITING_APPROVAL -> RUNNING now that approval is consumed and action is DISPATCHED
-        if matches!(task.state(), TaskState::AwaitingApproval(_)) {
-            task.transition(TaskState::Running)?;
-            ledger
-                .save_task(task, "approval_consumed_resumed_running", "action_gate")
-                .await?;
-        }
-
-        // 9. Post-Dispatch Execution & Independent Read-Back
-        // CRITICAL INVARIANT (`Requirement #3`): ANY error from this point onward MUST mark the
-        // intent `UNKNOWN` and transition the task to `OUTCOME_UNKNOWN`!
-        let ticket = VerifiedGateTicket::mint();
-        let exec_res = tool
-            .execute(&ticket, &task.task_id, idempotency_key, args)
-            .await;
-
-        let receipt = match exec_res {
-            Ok(r) => r,
-            Err(err_msg) => {
-                return Err(Self::enter_outcome_unknown(
-                    ledger,
-                    task,
-                    &mut intent,
-                    effective_approval_id,
-                    format!("execute_error:{err_msg}"),
-                )
-                .await);
-            }
-        };
-
-        intent.status = ActionIntentStatus::Executed;
-        intent.backend_receipt_id = Some(receipt.as_ref().to_string());
-        if let Err(e) = ledger
-            .update_action_post_dispatch(&intent, effective_approval_id)
-            .await
-        {
-            return Err(Self::enter_outcome_unknown(
-                ledger,
-                task,
-                &mut intent,
-                effective_approval_id,
-                format!("ledger_executed_update_error:{e}"),
-            )
-            .await);
-        }
-
-        match tool.readback_verify(args, &receipt).await {
-            Ok(true) => {
-                intent.status = ActionIntentStatus::Verified;
-                intent.readback_verified = true;
-                if let Err(e) = ledger
-                    .update_action_post_dispatch(&intent, effective_approval_id)
-                    .await
-                {
-                    return Err(Self::enter_outcome_unknown(
-                        ledger,
-                        task,
-                        &mut intent,
-                        effective_approval_id,
-                        format!("ledger_verified_update_error:{e}"),
-                    )
-                    .await);
-                }
-                task.consecutive_denials = 0;
-                ledger
-                    .save_task(task, &format!("action_verified:{tool_name}"), "action_gate")
-                    .await?;
-                Ok(GateOutcome::Executed {
-                    receipt,
-                    idempotency_key: idempotency_key.to_string(),
+            (ActionIntentStatus::Verified, Some(receipt_id)) => {
+                return Err(Verdict::Replay {
+                    receipt_id: receipt_id.clone(),
                     payload_hash,
-                    replayed: false,
-                })
+                });
             }
-            Ok(false) => Err(
-                Self::enter_outcome_unknown(
-                    ledger,
-                    task,
-                    &mut intent,
-                    effective_approval_id,
-                    "readback_verification_mismatch".into(),
-                )
-                .await,
-            ),
-            Err(rb_err) => Err(
-                Self::enter_outcome_unknown(
-                    ledger,
-                    task,
-                    &mut intent,
-                    effective_approval_id,
-                    format!("readback_error:{rb_err}"),
-                )
-                .await,
-            ),
+            (ActionIntentStatus::Failed | ActionIntentStatus::Planned, _) => {}
+            _ => return Err(Stop(E::UnreconciledIntentExists(key()))),
         }
     }
 
-    async fn enter_outcome_unknown<L: GateLedger>(
-        ledger: &L,
-        task: &mut TaskRecord,
-        intent: &mut ActionIntentRecord,
-        approval_id: Option<&str>,
-        detail: String,
-    ) -> GateError {
-        intent.status = ActionIntentStatus::Unknown;
-        intent.readback_verified = false;
-        let _ = ledger.update_action_post_dispatch(intent, approval_id).await;
-        if !matches!(task.state(), TaskState::OutcomeUnknown { .. }) {
-            let _ = task.transition(TaskState::OutcomeUnknown {
-                frozen_action_key: intent.idempotency_key.clone(),
-            });
-            let _ = ledger
-                .save_task(task, &format!("outcome_unknown:{detail}"), "action_gate")
-                .await;
-        }
-        GateError::PostDispatchUnknown {
-            idempotency_key: intent.idempotency_key.clone(),
+    // 6. A person approves R3 actions, and R2 actions under per-action approval.
+    let needs_approval = tier == RiskTier::R3
+        || (tier == RiskTier::R2 && config.autonomy_level == AutonomyLevel::PerActionApproval);
+    let mut dispatch = Dispatch {
+        tier,
+        canonical_args,
+        payload_hash,
+        approval_id: None,
+        is_retry,
+    };
+    if needs_approval {
+        let Some(approval_id) = &req.approval_id else {
+            return Ok(Verdict::NeedsApproval(dispatch));
+        };
+        check_approval(approval_id, ctx, &dispatch.payload_hash).map_err(Deny)?;
+        dispatch.approval_id = Some(approval_id.clone());
+    }
+
+    // 7–8. Register and send. The store checks the approval and the task version again in
+    // the same transaction that marks the intent DISPATCHED.
+    Ok(Verdict::Proceed(dispatch))
+}
+
+fn check_approval(
+    id: &ApprovalId,
+    ctx: &GateContext,
+    payload_hash: &str,
+) -> Result<(), PreDispatchError> {
+    use PreDispatchError as E;
+    let approval = ctx
+        .approval
+        .as_ref()
+        .filter(|a| &a.approval_id == id)
+        .ok_or_else(|| E::ApprovalNotFound(id.to_string()))?;
+    if approval.task_id != ctx.task.task_id {
+        return Err(E::ApprovalTaskMismatch);
+    }
+    match approval.status {
+        ApprovalStatus::Approved => {}
+        ApprovalStatus::Consumed => return Err(E::ApprovalAlreadyUsed(id.to_string())),
+        ApprovalStatus::Rejected => return Err(E::ApprovalRejected(id.to_string())),
+        ApprovalStatus::Expired => return Err(E::ApprovalExpired(id.to_string())),
+        ApprovalStatus::Pending => return Err(E::ApprovalNotApproved("PENDING".into())),
+    }
+    if ctx.now_epoch_s >= approval.expires_at_epoch_s {
+        return Err(E::ApprovalExpired(id.to_string()));
+    }
+    if approval.payload_hash != payload_hash {
+        return Err(E::ApprovalPayloadMismatch);
+    }
+    // The approver is neither the requester nor the person who configured the task type.
+    let approver = approval.approver_id.as_deref().unwrap_or_default();
+    if approver.is_empty()
+        || approver == ctx.task.requester_id
+        || approver == ctx.config.config_admin_id
+    {
+        return Err(E::SeparationOfDutiesViolation(approver.into()));
+    }
+    Ok(())
+}
+
+/// The first limit this task has used up, if any. Execution may not touch the spend
+/// reserved for closing.
+fn used_up_limit(
+    task: &TaskRecord,
+    config: &TaskTypeConfig,
+    now_epoch_s: i64,
+    is_retry: bool,
+) -> Option<&'static str> {
+    let limits = &config.budget_limits;
+    let running_ms = task.running_since_epoch_s.map_or(0, |since| {
+        (now_epoch_s - since).max(0).saturating_mul(1_000)
+    });
+    let max_wall_ms = i64::try_from(limits.max_wall_ms).unwrap_or(i64::MAX);
+    [
+        (task.turns_used >= limits.max_turns, "max_turns"),
+        (task.spend >= limits.usable_execution_spend(), "max_spend"),
+        (running_ms > max_wall_ms, "max_wall_clock"),
+        (
+            is_retry && task.retries_used >= limits.max_retries,
+            "max_retries",
+        ),
+        (
+            task.consecutive_denials >= limits.max_consecutive_denials,
+            "max_consecutive_denials",
+        ),
+        (task.reworks_used > limits.max_reworks, "max_reworks"),
+    ]
+    .into_iter()
+    .find_map(|(used_up, limit)| used_up.then_some(limit))
+}
+
+/// How many times `run` reads again and decides again when the task changed under it.
+const MAX_ATTEMPTS: usize = 3;
+
+/// One proposed call, end to end: decide, dispatch, execute, read back, record.
+pub async fn run<L: GateLedger, T: Tool>(
+    ledger: &L,
+    tool: &T,
+    req: &GateRequest<T::Args>,
+) -> Result<GateOutcome, GateError> {
+    let dispatch = match prepare(ledger, tool, req).await? {
+        Prepared::Done(outcome) => return Ok(outcome),
+        Prepared::Dispatched(dispatch) => dispatch,
+    };
+
+    // The request may leave from here on: no retries, and every outcome is recorded.
+    let ticket = VerifiedGateTicket(());
+    let result = match tool
+        .execute(&ticket, &req.task_id, &req.idempotency_key, &req.args)
+        .await
+    {
+        Ok(receipt_id) => match tool.readback(&req.args, &receipt_id).await {
+            Ok(()) => DispatchResult::Verified { receipt_id },
+            Err(why) => DispatchResult::Unknown {
+                receipt_id: Some(receipt_id),
+                detail: format!("readback:{why}"),
+            },
+        },
+        Err(ExecError::NotSent(why)) => DispatchResult::NotSent { detail: why },
+        Err(ExecError::Unknown(why)) => DispatchResult::Unknown {
+            receipt_id: None,
+            detail: why,
+        },
+    };
+    // If this write fails the intent stays DISPATCHED, and recovery reconciles it.
+    ledger
+        .finish_dispatch(&req.task_id, &req.idempotency_key, &result)
+        .await?;
+    match result {
+        DispatchResult::Verified { receipt_id } => Ok(GateOutcome::Executed {
+            receipt_id,
+            payload_hash: dispatch.payload_hash,
+            replayed: false,
+        }),
+        DispatchResult::NotSent { detail } => Err(GateError::NotSent(detail)),
+        DispatchResult::Unknown { detail, .. } => Err(GateError::PostDispatchUnknown {
+            idempotency_key: req.idempotency_key.to_string(),
             detail,
+        }),
+    }
+}
+
+enum Prepared {
+    Done(GateOutcome),
+    Dispatched(Dispatch),
+}
+
+/// Everything before the request leaves. Nothing external has happened yet, so after a
+/// version conflict it is safe to start over.
+async fn prepare<L: GateLedger, T: Tool>(
+    ledger: &L,
+    tool: &T,
+    req: &GateRequest<T::Args>,
+) -> Result<Prepared, GateError> {
+    for _ in 0..MAX_ATTEMPTS {
+        match prepare_once(ledger, tool, req).await {
+            Err(GateError::Conflict(_)) => continue,
+            other => return other,
+        }
+    }
+    Err(GateError::Conflict(format!(
+        "task {} kept changing while the gate decided",
+        req.task_id
+    )))
+}
+
+async fn prepare_once<L: GateLedger, T: Tool>(
+    ledger: &L,
+    tool: &T,
+    req: &GateRequest<T::Args>,
+) -> Result<Prepared, GateError> {
+    let ctx = ledger
+        .load_context(&req.task_id, &req.idempotency_key, req.approval_id.as_ref())
+        .await?;
+    let verdict = match tool.load_facts(&ctx.task, &req.args).await {
+        Ok(facts) => decide(tool, req, &ctx, &facts),
+        // A check that cannot run fails closed.
+        Err(e) => Verdict::Deny(PreDispatchError::CheckFailed(e.to_string())),
+    };
+    let now = ctx.now_epoch_s;
+    let mut task = ctx.task;
+    match verdict {
+        Verdict::Stop(reason) => Err(reason.into()),
+        Verdict::Deny(reason) => {
+            ledger.record_denial(&task.task_id, &reason).await?;
+            Err(reason.into())
+        }
+        Verdict::Limit(limit) => {
+            task.transition(
+                TaskState::LimitReached {
+                    reason: limit.clone(),
+                },
+                now,
+            )?;
+            ledger
+                .save_task(&task, &format!("limit_reached:{limit}"))
+                .await?;
+            Err(PreDispatchError::LimitReached(limit).into())
+        }
+        Verdict::Replay {
+            receipt_id,
+            payload_hash,
+        } => Ok(Prepared::Done(GateOutcome::Executed {
+            receipt_id,
+            payload_hash,
+            replayed: true,
+        })),
+        Verdict::NeedsApproval(dispatch) => {
+            let waits = &ctx.config.waits;
+            let deadline = now + waits.approval_ttl_s;
+            let wait = WaitMetadata::new(&waits.approver_role, deadline, TimeoutAction::Decline)?;
+            task.turns_used += 1;
+            task.transition(TaskState::AwaitingApproval(wait), now)?;
+            let approval = NewApproval {
+                tool_name: tool.name().into(),
+                target: req.target.clone(),
+                payload_hash: dispatch.payload_hash.clone(),
+                args_json: dispatch.canonical_args,
+                expires_at_epoch_s: deadline,
+            };
+            let approval_id = ledger.request_approval(&task, &approval).await?;
+            Ok(Prepared::Done(GateOutcome::NeedsApproval {
+                approval_id,
+                payload_hash: dispatch.payload_hash,
+            }))
+        }
+        Verdict::Proceed(dispatch) => {
+            task.turns_used += 1;
+            if dispatch.is_retry {
+                task.retries_used += 1;
+            }
+            let intent = ActionIntentRecord {
+                idempotency_key: req.idempotency_key.clone(),
+                task_id: task.task_id.clone(),
+                tool_name: tool.name().into(),
+                target: req.target.clone(),
+                args_json: dispatch.canonical_args.clone(),
+                payload_hash: dispatch.payload_hash.clone(),
+                status: ActionIntentStatus::Dispatched,
+                backend_receipt_id: None,
+                readback_verified: false,
+            };
+            ledger
+                .begin_dispatch(&task, dispatch.approval_id.as_ref(), &intent)
+                .await?;
+            Ok(Prepared::Dispatched(dispatch))
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
-    use std::pin::pin;
-    use std::task::{Context, Poll, Waker};
-    use trade_core::{ApprovalStatus, BudgetLimits, ShapeLevel};
-
-    fn block_on_ready<F: Future>(fut: F) -> F::Output {
-        let mut pinned = pin!(fut);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        match pinned.as_mut().poll(&mut cx) {
-            Poll::Ready(val) => val,
-            Poll::Pending => panic!("mock future unexpectedly returned Pending"),
-        }
-    }
-
-    #[derive(Default)]
-    struct MockLedger {
-        intents: RefCell<BTreeMap<String, ActionIntentRecord>>,
-        approvals: RefCell<BTreeMap<String, (String, String, ApprovalStatus, String)>>, // id -> (task_id, hash, status, approver)
-    }
-
-    impl GateLedger for MockLedger {
-        async fn save_task(
-            &self,
-            task: &mut TaskRecord,
-            _reason: &str,
-            _actor: &str,
-        ) -> Result<(), GateError> {
-            task.advance_persisted_version(task.version() + 1);
-            Ok(())
-        }
-
-        async fn get_action_intent(
-            &self,
-            idempotency_key: &str,
-        ) -> Result<Option<ActionIntentRecord>, GateError> {
-            Ok(self.intents.borrow().get(idempotency_key).cloned())
-        }
-
-        async fn create_pending_approval(
-            &self,
-            task_id: &str,
-            _requester_id: &str,
-            _tool_name: &str,
-            _target: &str,
-            payload_hash: &str,
-            _canonical_args: &str,
-        ) -> Result<String, GateError> {
-            let id = "APR-MOCK-1".to_string();
-            self.approvals.borrow_mut().insert(
-                id.clone(),
-                (
-                    task_id.to_string(),
-                    payload_hash.to_string(),
-                    ApprovalStatus::Pending,
-                    String::new(),
-                ),
-            );
-            Ok(id)
-        }
-
-        async fn consume_approval_and_mark_dispatched(
-            &self,
-            approval_id: Option<&str>,
-            task: &TaskRecord,
-            config: &TaskTypeConfig,
-            intent: &ActionIntentRecord,
-        ) -> Result<(), GateError> {
-            if let Some(aid) = approval_id {
-                let mut map = self.approvals.borrow_mut();
-                let Some((tid, ph, st, approver)) = map.get_mut(aid) else {
-                    return Err(PreDispatchError::ApprovalNotFound(aid.into()).into());
-                };
-                if tid != &task.task_id {
-                    return Err(PreDispatchError::ApprovalTaskMismatch.into());
-                }
-                if *st == ApprovalStatus::Consumed {
-                    return Err(PreDispatchError::ApprovalAlreadyUsed(aid.into()).into());
-                }
-                if *st != ApprovalStatus::Approved {
-                    return Err(PreDispatchError::ApprovalNotApproved(st.as_str().into()).into());
-                }
-                if ph != &intent.payload_hash {
-                    return Err(PreDispatchError::ApprovalPayloadMismatch.into());
-                }
-                if approver == &task.requester_id || approver == &config.config_admin_id {
-                    return Err(
-                        PreDispatchError::SeparationOfDutiesViolation(approver.clone()).into(),
-                    );
-                }
-                *st = ApprovalStatus::Consumed;
-            }
-            self.intents
-                .borrow_mut()
-                .insert(intent.idempotency_key.clone(), intent.clone());
-            Ok(())
-        }
-
-        async fn update_action_post_dispatch(
-            &self,
-            intent: &ActionIntentRecord,
-            _approval_id: Option<&str>,
-        ) -> Result<(), GateError> {
-            self.intents
-                .borrow_mut()
-                .insert(intent.idempotency_key.clone(), intent.clone());
-            Ok(())
-        }
-    }
-
-    struct MockTool {
-        tool_name: &'static str,
-        tier: RiskTier,
-        fail_execute: bool,
-        fail_readback: bool,
-    }
-
-    impl Tool for MockTool {
-        type Args = String;
-        type Receipt = String;
-
-        fn name(&self) -> &str {
-            self.tool_name
-        }
-        fn risk_tier(&self) -> RiskTier {
-            self.tier
-        }
-        fn canonical_args_json(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
-            Ok(format!("\"{args}\""))
-        }
-        fn validate_args(
-            &self,
-            args: &Self::Args,
-            _task: &TaskRecord,
-        ) -> Result<(), PreDispatchError> {
-            if args.is_empty() {
-                return Err(PreDispatchError::InvalidArguments("empty".into()));
-            }
-            Ok(())
-        }
-        async fn check_business_rules(
-            &self,
-            _args: &Self::Args,
-            _task: &TaskRecord,
-        ) -> Result<(), PreDispatchError> {
-            Ok(())
-        }
-        async fn execute(
-            &self,
-            _ticket: &VerifiedGateTicket,
-            _task_id: &str,
-            _idempotency_key: &str,
-            _args: &Self::Args,
-        ) -> Result<Self::Receipt, String> {
-            if self.fail_execute {
-                return Err("network_drop_after_dispatch".into());
-            }
-            Ok("RCPT-1".into())
-        }
-        async fn readback_verify(
-            &self,
-            _args: &Self::Args,
-            _receipt: &Self::Receipt,
-        ) -> Result<bool, String> {
-            Ok(!self.fail_readback)
-        }
-        async fn rehydrate_verified_receipt(
-            &self,
-            receipt_id: &str,
-        ) -> Result<Option<Self::Receipt>, String> {
-            Ok(Some(receipt_id.to_string()))
-        }
-    }
-
-    fn test_config() -> TaskTypeConfig {
-        let mut allowed = BTreeMap::new();
-        allowed.insert("r2_draft".into(), RiskTier::R2);
-        allowed.insert("r3_order".into(), RiskTier::R3);
-        allowed.insert("r4_banned".into(), RiskTier::R4);
-        TaskTypeConfig {
-            task_type: "test".into(),
-            version: "1.0".into(),
-            shape_level: ShapeLevel::MultiAgent,
-            shape_rationale: "test".into(),
-            autonomy_level: AutonomyLevel::DraftOnly,
-            config_admin_id: "admin".into(),
-            allowed_tools: allowed,
-            budget_limits: BudgetLimits::default(),
-            done_criteria: vec!["ok".into()],
-        }
-    }
-
-    #[test]
-    fn unconfigured_and_r4_tools_are_pre_dispatch_denied() {
-        let ledger = MockLedger::default();
-        let cfg = test_config();
-        let mut task = TaskRecord::new_queued(
-            "T1",
-            "k1",
-            "test",
-            "1.0",
-            "alice",
-            "svc",
-            "cli",
-            vec!["US".into()],
-        )
-        .unwrap();
-        task.transition(TaskState::Running).unwrap();
-        let mut mounted = BTreeSet::new();
-        mounted.insert("unlisted".into());
-        mounted.insert("r4_banned".into());
-
-        let unlisted = MockTool {
-            tool_name: "unlisted",
-            tier: RiskTier::R2,
-            fail_execute: false,
-            fail_readback: false,
-        };
-        let err1 = block_on_ready(ActionGate::evaluate_and_execute(
-            &ledger,
-            &unlisted,
-            &mut task,
-            &cfg,
-            &mounted,
-            "tgt",
-            &"ok".to_string(),
-            "idem-1",
-            None,
-            0,
-            false,
-        ))
-        .unwrap_err();
-        assert_eq!(
-            err1,
-            GateError::PreDispatch(PreDispatchError::ToolNotConfigured("unlisted".into()))
-        );
-        assert_eq!(task.state().code(), "RUNNING");
-
-        let r4_tool = MockTool {
-            tool_name: "r4_banned",
-            tier: RiskTier::R4,
-            fail_execute: false,
-            fail_readback: false,
-        };
-        let err2 = block_on_ready(ActionGate::evaluate_and_execute(
-            &ledger,
-            &r4_tool,
-            &mut task,
-            &cfg,
-            &mounted,
-            "tgt",
-            &"ok".to_string(),
-            "idem-2",
-            None,
-            0,
-            false,
-        ))
-        .unwrap_err();
-        assert_eq!(
-            err2,
-            GateError::PreDispatch(PreDispatchError::R4PermanentlyProhibited("r4_banned".into()))
-        );
-    }
-
-    #[test]
-    fn post_dispatch_error_forces_outcome_unknown_and_freezes_task() {
-        let ledger = MockLedger::default();
-        let cfg = test_config();
-        let mut task = TaskRecord::new_queued(
-            "T2",
-            "k2",
-            "test",
-            "1.0",
-            "alice",
-            "svc",
-            "cli",
-            vec!["US".into()],
-        )
-        .unwrap();
-        task.transition(TaskState::Running).unwrap();
-        let mut mounted = BTreeSet::new();
-        mounted.insert("r2_draft".into());
-
-        let flaky = MockTool {
-            tool_name: "r2_draft",
-            tier: RiskTier::R2,
-            fail_execute: true,
-            fail_readback: false,
-        };
-        let err = block_on_ready(ActionGate::evaluate_and_execute(
-            &ledger,
-            &flaky,
-            &mut task,
-            &cfg,
-            &mounted,
-            "tgt",
-            &"payload".to_string(),
-            "idem-flaky",
-            None,
-            0,
-            false,
-        ))
-        .unwrap_err();
-
-        assert!(matches!(err, GateError::PostDispatchUnknown { .. }));
-        assert_eq!(task.state().code(), "OUTCOME_UNKNOWN");
-
-        // Subsequent calls while OUTCOME_UNKNOWN are frozen with PreDispatch(TaskFrozenOutcomeUnknown)
-        let frozen_err = block_on_ready(ActionGate::evaluate_and_execute(
-            &ledger,
-            &flaky,
-            &mut task,
-            &cfg,
-            &mounted,
-            "tgt",
-            &"payload".to_string(),
-            "idem-other",
-            None,
-            0,
-            false,
-        ))
-        .unwrap_err();
-        assert_eq!(
-            frozen_err,
-            GateError::PreDispatch(PreDispatchError::TaskFrozenOutcomeUnknown(
-                "idem-flaky".into()
-            ))
-        );
-    }
-}
+mod tests;

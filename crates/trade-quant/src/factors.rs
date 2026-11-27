@@ -2,7 +2,110 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use trade_core::{AsOfDate, FilingDate, PeriodEndDate, PitSecuritySnapshot};
+
+/// Weights and thresholds of the factor model. The defaults reproduce the Python
+/// baseline; `config/strategy.toml` can override any of them without recompiling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FactorParams {
+    /// Securities trading less than this per day are vetoed as illiquid.
+    pub min_adv_usd: f64,
+    pub weights: BucketWeights,
+    /// Weight of momentum, used only to break near-ties.
+    pub momentum_tiebreak: f64,
+    pub penalty: PenaltyParams,
+    pub veto: VetoParams,
+}
+
+/// How much each factor bucket contributes to the alpha score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BucketWeights {
+    pub valuation: f64,
+    pub quality: f64,
+    pub financial_health: f64,
+    pub earnings_quality: f64,
+    pub cash_flow: f64,
+    pub growth: f64,
+    pub capital_allocation: f64,
+}
+
+/// Soft risk penalties: half a point per breached threshold, then weighted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PenaltyParams {
+    pub altman_z_below: f64,
+    pub interest_cov_below: f64,
+    pub beneish_m_above: f64,
+    pub accruals_above: f64,
+    pub distress_weight: f64,
+    pub manipulation_weight: f64,
+    pub illiquidity_weight: f64,
+}
+
+/// Hard vetoes: any one of them excludes the security.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VetoParams {
+    pub altman_z_below: f64,
+    pub interest_cov_below: f64,
+    pub beneish_m_above: f64,
+    /// ...together with accruals at or above this quantile of the universe.
+    pub accruals_quantile: f64,
+}
+
+impl Default for FactorParams {
+    fn default() -> Self {
+        Self {
+            min_adv_usd: 1_000_000.0,
+            weights: BucketWeights::default(),
+            momentum_tiebreak: 0.05,
+            penalty: PenaltyParams::default(),
+            veto: VetoParams::default(),
+        }
+    }
+}
+
+impl Default for BucketWeights {
+    fn default() -> Self {
+        Self {
+            valuation: 0.30,
+            quality: 0.20,
+            financial_health: 0.15,
+            earnings_quality: 0.10,
+            cash_flow: 0.10,
+            growth: 0.10,
+            capital_allocation: 0.05,
+        }
+    }
+}
+
+impl Default for PenaltyParams {
+    fn default() -> Self {
+        Self {
+            altman_z_below: 2.99,
+            interest_cov_below: 4.0,
+            beneish_m_above: -2.20,
+            accruals_above: 0.05,
+            distress_weight: 0.15,
+            manipulation_weight: 0.15,
+            illiquidity_weight: 0.10,
+        }
+    }
+}
+
+impl Default for VetoParams {
+    fn default() -> Self {
+        Self {
+            altman_z_below: 1.8,
+            interest_cov_below: 1.5,
+            beneish_m_above: -1.78,
+            accruals_quantile: 0.80,
+        }
+    }
+}
 
 pub const FACTOR_NAMES: [&str; 15] = [
     "bm",
@@ -42,7 +145,6 @@ pub struct QuantSecurityResult {
     pub hard_veto: bool,
     pub veto_reasons: Vec<String>,
     pub adv_usd: f64,
-    pub forward_1m_return: f64,
     pub delist_date: Option<String>,
     pub delist_return: Option<f64>,
     pub assumptions: Vec<String>,
@@ -146,8 +248,14 @@ pub fn compute_raw_factors(row: &PitSecuritySnapshot) -> (BTreeMap<String, f64>,
     f.insert("fcf_ev".into(), fcf / ev);
     f.insert("gp_assets".into(), row.gross_profit / total_assets);
     f.insert("roic".into(), row.roic);
-    f.insert("net_debt_ebitda_inv".into(), -(net_debt / row.ebit.max(1e-6)));
-    f.insert("interest_cov".into(), row.ebit / row.interest_expense.max(1e-6));
+    f.insert(
+        "net_debt_ebitda_inv".into(),
+        -(net_debt / row.ebit.max(1e-6)),
+    );
+    f.insert(
+        "interest_cov".into(),
+        row.ebit / row.interest_expense.max(1e-6),
+    );
     f.insert("altman_z".into(), altman_z);
     f.insert("accruals_inv".into(), -raw_accruals);
     f.insert("cfo_ni".into(), cfo_ni);
@@ -171,8 +279,9 @@ fn round4(x: f64) -> f64 {
 pub fn score_pit_universe(
     snapshots: &[PitSecuritySnapshot],
     as_of_date: &AsOfDate,
-    min_adv_usd: f64,
+    params: &FactorParams,
 ) -> Vec<QuantSecurityResult> {
+    let (w, pen, veto) = (&params.weights, &params.penalty, &params.veto);
     if snapshots.is_empty() {
         return Vec::new();
     }
@@ -193,7 +302,7 @@ pub fn score_pit_universe(
 
     let mut sorted_acc = accruals_vec.clone();
     sorted_acc.sort_by(|a, b| a.total_cmp(b));
-    let p80_accruals = quantile(&sorted_acc, 0.80);
+    let accruals_veto_level = quantile(&sorted_acc, veto.accruals_quantile);
 
     // Group by (market, industry), falling back to (market, "__fallback__") if group < 3
     let mut initial_groups: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
@@ -252,13 +361,13 @@ pub fn score_pit_universe(
         let cap_b = sf["net_share_issuance_inv"];
         let mom_b = sf["momentum_12_1"];
 
-        let alpha_score = 0.30 * val_b
-            + 0.20 * qual_b
-            + 0.15 * health_b
-            + 0.10 * eq_b
-            + 0.10 * cf_b
-            + 0.10 * growth_b
-            + 0.05 * cap_b;
+        let alpha_score = w.valuation * val_b
+            + w.quality * qual_b
+            + w.financial_health * health_b
+            + w.earnings_quality * eq_b
+            + w.cash_flow * cf_b
+            + w.growth * growth_b
+            + w.capital_allocation * cap_b;
 
         let mut bucket_scores = BTreeMap::new();
         bucket_scores.insert("valuation".into(), round4(val_b));
@@ -271,43 +380,49 @@ pub fn score_pit_universe(
         bucket_scores.insert("momentum_tiebreak".into(), round4(mom_b));
 
         let mut d_pen = 0.0;
-        if rf["altman_z"] < 2.99 {
+        if rf["altman_z"] < pen.altman_z_below {
             d_pen += 0.5;
         }
-        if rf["interest_cov"] < 4.0 {
+        if rf["interest_cov"] < pen.interest_cov_below {
             d_pen += 0.5;
         }
         let mut m_pen = 0.0;
-        if row.beneish_m > -2.20 {
+        if row.beneish_m > pen.beneish_m_above {
             m_pen += 0.5;
         }
-        if raw_acc > 0.05 {
+        if raw_acc > pen.accruals_above {
             m_pen += 0.5;
         }
         let l_pen = sf["amihud_illiq"].max(0.0);
-        let risk_penalty = 0.15 * d_pen + 0.15 * m_pen + 0.10 * l_pen;
-        let quant_score = (alpha_score + 0.05 * mom_b - risk_penalty).clamp(-1.0, 1.0);
+        let risk_penalty = pen.distress_weight * d_pen
+            + pen.manipulation_weight * m_pen
+            + pen.illiquidity_weight * l_pen;
+        let quant_score =
+            (alpha_score + params.momentum_tiebreak * mom_b - risk_penalty).clamp(-1.0, 1.0);
 
         let mut veto_reasons = Vec::new();
-        if rf["altman_z"] < 1.8 {
-            veto_reasons.push(format!("distress_zscore(Z={:.2}<1.80)", rf["altman_z"]));
-        }
-        if rf["interest_cov"] < 1.5 {
+        if rf["altman_z"] < veto.altman_z_below {
             veto_reasons.push(format!(
-                "low_interest_coverage(IC={:.2}<1.50)",
-                rf["interest_cov"]
+                "distress_zscore(Z={:.2}<{:.2})",
+                rf["altman_z"], veto.altman_z_below
             ));
         }
-        if row.beneish_m > -1.78 && raw_acc >= p80_accruals {
+        if rf["interest_cov"] < veto.interest_cov_below {
             veto_reasons.push(format!(
-                "earnings_manipulation_risk(M={:.2}>-1.78,Acc={:.3})",
-                row.beneish_m, raw_acc
+                "low_interest_coverage(IC={:.2}<{:.2})",
+                rf["interest_cov"], veto.interest_cov_below
+            ));
+        }
+        if row.beneish_m > veto.beneish_m_above && raw_acc >= accruals_veto_level {
+            veto_reasons.push(format!(
+                "earnings_manipulation_risk(M={:.2}>{:.2},Acc={:.3})",
+                row.beneish_m, veto.beneish_m_above, raw_acc
             ));
         }
         if row.cfo < 0.0 && row.net_income > 0.0 {
             veto_reasons.push("negative_cfo_positive_ni".into());
         }
-        if row.adv_usd < min_adv_usd || row.is_halted || row.is_st {
+        if row.adv_usd < params.min_adv_usd || row.is_halted || row.is_st {
             veto_reasons.push("illiquidity_or_restricted".into());
         }
 
@@ -330,7 +445,6 @@ pub fn score_pit_universe(
             hard_veto: !veto_reasons.is_empty(),
             veto_reasons,
             adv_usd: row.adv_usd,
-            forward_1m_return: row.forward_1m_return,
             delist_date: row.delist_date.clone(),
             delist_return: row.delist_return,
             assumptions: assumptions[idx].clone(),

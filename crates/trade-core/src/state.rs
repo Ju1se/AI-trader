@@ -1,41 +1,76 @@
-//! Exact 13-state algebraic state machine per Diagram 4a:
-//! `QUEUED`, `RUNNING`, `AWAITING_INPUT`, `AWAITING_APPROVAL`, `OUTCOME_UNKNOWN`,
-//! `LIMIT_REACHED`, `VERIFYING`, `SETTLING`, `COMPLETED`, `FAILED`, `HANDED_OFF`,
-//! `DECLINED`, `CANCELLED`.
-//! `TaskRecord.state` and `TaskRecord.version` are strictly private and can only change
-//! via `TaskRecord::transition()`, which validates Diagram 4a's transition matrix.
+//! The 13 task states of Diagram 4a and the only legal moves between them.
+//!
+//! The state is private to `TaskRecord` and changes only through `TaskRecord::transition`,
+//! which checks `TaskState::can_transition`. Cycles in the diagram (waiting and running,
+//! reopening after completion) are just rows in that table; no state holds a reference
+//! to another.
 
 use std::fmt;
-use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{require_non_empty, SchemaError, UsdCents};
+use crate::ids::{IdempotencyKey, TaskId};
+use crate::types::{SchemaError, UsdCents, require_non_empty};
 
+/// What happens when nobody acts on a waiting task before its deadline.
+/// A timeout is never a silent approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeoutAction {
+    /// Hand the task to a person.
+    HandOff,
+    /// Treat the pending approval as rejected.
+    Decline,
+    /// Close the settlement window as accepted.
+    Complete,
+    /// Re-assign the hand-off to the backup owner.
+    Escalate,
+}
+
+impl TimeoutAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HandOff => "HAND_OFF",
+            Self::Decline => "DECLINE",
+            Self::Complete => "COMPLETE",
+            Self::Escalate => "ESCALATE",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Result<Self, SchemaError> {
+        match s {
+            "HAND_OFF" => Ok(Self::HandOff),
+            "DECLINE" => Ok(Self::Decline),
+            "COMPLETE" => Ok(Self::Complete),
+            "ESCALATE" => Ok(Self::Escalate),
+            other => Err(SchemaError(format!("unknown_timeout_action:{other}"))),
+        }
+    }
+}
+
+/// Every waiting state names who must act, by when, and what happens at the deadline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitMetadata {
     pub owner_id: String,
-    pub deadline_iso: String,
-    pub timeout_action: String,
+    pub deadline_epoch_s: i64,
+    pub timeout_action: TimeoutAction,
 }
 
 impl WaitMetadata {
     pub fn new(
         owner_id: impl Into<String>,
-        deadline_iso: impl Into<String>,
-        timeout_action: impl Into<String>,
+        deadline_epoch_s: i64,
+        timeout_action: TimeoutAction,
     ) -> Result<Self, SchemaError> {
-        let owner_id = owner_id.into();
-        let deadline_iso = deadline_iso.into();
-        let timeout_action = timeout_action.into();
-        require_non_empty(&owner_id, "wait_meta.owner_id")?;
-        require_non_empty(&deadline_iso, "wait_meta.deadline_iso")?;
-        require_non_empty(&timeout_action, "wait_meta.timeout_action")?;
-        Ok(Self {
-            owner_id,
-            deadline_iso,
+        let wait = Self {
+            owner_id: owner_id.into(),
+            deadline_epoch_s,
             timeout_action,
-        })
+        };
+        require_non_empty(&wait.owner_id, "wait.owner_id")?;
+        if wait.deadline_epoch_s <= 0 {
+            return Err(SchemaError("wait.deadline_epoch_s must be > 0".into()));
+        }
+        Ok(wait)
     }
 }
 
@@ -45,7 +80,7 @@ pub enum TaskState {
     Running,
     AwaitingInput(WaitMetadata),
     AwaitingApproval(WaitMetadata),
-    OutcomeUnknown { frozen_action_key: String },
+    OutcomeUnknown { frozen_action_key: IdempotencyKey },
     LimitReached { reason: String },
     Verifying,
     Settling(WaitMetadata),
@@ -91,11 +126,12 @@ impl TaskState {
             Self::LimitReached { reason }
             | Self::Failed { reason }
             | Self::Declined { reason }
-            | Self::Cancelled { reason } => Some(reason.as_str()),
+            | Self::Cancelled { reason } => Some(reason),
             _ => None,
         }
     }
 
+    /// No way out at all.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -103,143 +139,79 @@ impl TaskState {
         )
     }
 
-    /// Strict DB deserialization: NEVER defaults unrecognized status strings to `Failed`!
+    /// The agent's work has ended. Completed tasks can still be reopened and handed-off
+    /// tasks handed back, but neither needs the agent until that happens.
+    pub fn is_closed(&self) -> bool {
+        self.is_terminal() || matches!(self, Self::Completed | Self::HandedOff(_))
+    }
+
+    /// Rebuild a state read from the database. Unknown codes are an error, never a default.
     pub fn from_db_parts(
         code: &str,
         detail: Option<String>,
-        wait_meta: Option<WaitMetadata>,
+        wait: Option<WaitMetadata>,
     ) -> Result<Self, SchemaError> {
-        let require_wait = |state_name: &str| -> Result<WaitMetadata, SchemaError> {
-            wait_meta.ok_or_else(|| {
-                SchemaError(format!(
-                    "waiting state {state_name} missing required WaitMetadata"
-                ))
-            })
+        let wait = |name: &str| {
+            wait.clone()
+                .ok_or_else(|| SchemaError(format!("waiting state {name} has no wait metadata")))
         };
-
-        match code {
-            "QUEUED" => Ok(Self::Queued),
-            "RUNNING" => Ok(Self::Running),
-            "AWAITING_INPUT" => Ok(Self::AwaitingInput(require_wait("AWAITING_INPUT")?)),
-            "AWAITING_APPROVAL" => Ok(Self::AwaitingApproval(require_wait("AWAITING_APPROVAL")?)),
+        let detail = detail.unwrap_or_default();
+        Ok(match code {
+            "QUEUED" => Self::Queued,
+            "RUNNING" => Self::Running,
+            "AWAITING_INPUT" => Self::AwaitingInput(wait(code)?),
+            "AWAITING_APPROVAL" => Self::AwaitingApproval(wait(code)?),
             "OUTCOME_UNKNOWN" => {
-                let key = detail.unwrap_or_default();
-                require_non_empty(&key, "outcome_unknown.frozen_action_key")?;
-                Ok(Self::OutcomeUnknown {
-                    frozen_action_key: key,
-                })
+                require_non_empty(&detail, "outcome_unknown.frozen_action_key")?;
+                Self::OutcomeUnknown {
+                    frozen_action_key: IdempotencyKey::new(detail),
+                }
             }
-            "LIMIT_REACHED" => Ok(Self::LimitReached {
-                reason: detail.unwrap_or_default(),
-            }),
-            "VERIFYING" => Ok(Self::Verifying),
-            "SETTLING" => Ok(Self::Settling(require_wait("SETTLING")?)),
-            "COMPLETED" => Ok(Self::Completed),
-            "FAILED" => Ok(Self::Failed {
-                reason: detail.unwrap_or_default(),
-            }),
-            "HANDED_OFF" => Ok(Self::HandedOff(require_wait("HANDED_OFF")?)),
-            "DECLINED" => Ok(Self::Declined {
-                reason: detail.unwrap_or_default(),
-            }),
-            "CANCELLED" => Ok(Self::Cancelled {
-                reason: detail.unwrap_or_default(),
-            }),
-            unknown => Err(SchemaError(format!("unknown_task_state:{unknown}"))),
-        }
+            "LIMIT_REACHED" => Self::LimitReached { reason: detail },
+            "VERIFYING" => Self::Verifying,
+            "SETTLING" => Self::Settling(wait(code)?),
+            "COMPLETED" => Self::Completed,
+            "FAILED" => Self::Failed { reason: detail },
+            "HANDED_OFF" => Self::HandedOff(wait(code)?),
+            "DECLINED" => Self::Declined { reason: detail },
+            "CANCELLED" => Self::Cancelled { reason: detail },
+            unknown => return Err(SchemaError(format!("unknown_task_state:{unknown}"))),
+        })
     }
 
-    /// Diagram 4a explicit legal state transition matrix.
+    /// The legal moves of Diagram 4a, row by row. Anything not listed is illegal.
     pub fn can_transition(&self, next: &Self) -> bool {
+        use TaskState as S;
         match (self, next) {
-            // QUEUED -> RUNNING | DECLINED | CANCELLED | HANDED_OFF
+            // Any state the agent is still working on can be handed to a person.
+            (from, S::HandedOff(_)) if !from.is_closed() => true,
+            // Cancelling is allowed while working, except when an action's outcome is
+            // unknown: that must be reconciled first.
+            (from, S::Cancelled { .. }) => {
+                !from.is_closed() && !matches!(from, S::OutcomeUnknown { .. })
+            }
+            (S::Queued, S::Running | S::Failed { .. }) => true,
             (
-                Self::Queued,
-                Self::Running
-                | Self::Declined { .. }
-                | Self::Cancelled { .. }
-                | Self::HandedOff(_),
+                S::Running,
+                S::AwaitingInput(_)
+                | S::AwaitingApproval(_)
+                | S::OutcomeUnknown { .. }
+                | S::LimitReached { .. }
+                | S::Verifying
+                | S::Failed { .. },
             ) => true,
-
-            // RUNNING -> active wait / error / verification / close states
-            (
-                Self::Running,
-                Self::AwaitingInput(_)
-                | Self::AwaitingApproval(_)
-                | Self::OutcomeUnknown { .. }
-                | Self::LimitReached { .. }
-                | Self::Verifying
-                | Self::HandedOff(_)
-                | Self::Failed { .. }
-                | Self::Declined { .. }
-                | Self::Cancelled { .. },
-            ) => true,
-
-            // AWAITING_INPUT -> RUNNING | HANDED_OFF | DECLINED | CANCELLED | LIMIT_REACHED
-            (
-                Self::AwaitingInput(_),
-                Self::Running
-                | Self::HandedOff(_)
-                | Self::Declined { .. }
-                | Self::Cancelled { .. }
-                | Self::LimitReached { .. },
-            ) => true,
-
-            // AWAITING_APPROVAL -> RUNNING | DECLINED | HANDED_OFF | CANCELLED | LIMIT_REACHED
-            (
-                Self::AwaitingApproval(_),
-                Self::Running
-                | Self::Declined { .. }
-                | Self::HandedOff(_)
-                | Self::Cancelled { .. }
-                | Self::LimitReached { .. },
-            ) => true,
-
-            // OUTCOME_UNKNOWN -> strictly frozen until reconciled (RUNNING) or escalated (HANDED_OFF / FAILED)
-            (
-                Self::OutcomeUnknown { .. },
-                Self::Running | Self::HandedOff(_) | Self::Failed { .. },
-            ) => true,
-
-            // LIMIT_REACHED -> HANDED_OFF | RUNNING (human limit extension) | CANCELLED | FAILED
-            (
-                Self::LimitReached { .. },
-                Self::HandedOff(_)
-                | Self::Running
-                | Self::Cancelled { .. }
-                | Self::Failed { .. },
-            ) => true,
-
-            // VERIFYING -> SETTLING | RUNNING (rework) | LIMIT_REACHED | HANDED_OFF | FAILED
-            (
-                Self::Verifying,
-                Self::Settling(_)
-                | Self::Running
-                | Self::LimitReached { .. }
-                | Self::HandedOff(_)
-                | Self::Failed { .. },
-            ) => true,
-
-            // SETTLING -> COMPLETED | RUNNING (disputed) | HANDED_OFF | FAILED
-            (
-                Self::Settling(_),
-                Self::Completed | Self::Running | Self::HandedOff(_) | Self::Failed { .. },
-            ) => true,
-
-            // COMPLETED -> RUNNING (post-settlement reopen per Agent 7 5.3)
-            (Self::Completed, Self::Running) => true,
-
-            // HANDED_OFF -> RUNNING | COMPLETED | DECLINED | CANCELLED | FAILED
-            (
-                Self::HandedOff(_),
-                Self::Running
-                | Self::Completed
-                | Self::Declined { .. }
-                | Self::Cancelled { .. }
-                | Self::Failed { .. },
-            ) => true,
-
-            // Terminal states (FAILED, DECLINED, CANCELLED) and all unlisted transitions are illegal
+            (S::AwaitingInput(_), S::Running) => true,
+            // Approved, or rejected but the goal is still reachable without the action.
+            (S::AwaitingApproval(_), S::Running | S::Declined { .. }) => true,
+            (S::OutcomeUnknown { .. }, S::Running) => true,
+            // More budget granted, or verify and deliver what is already done.
+            (S::LimitReached { .. }, S::Running | S::Verifying) => true,
+            (S::Verifying, S::Running | S::Settling(_) | S::Failed { .. }) => true,
+            (S::Settling(_), S::Completed | S::Running) => true,
+            // Reopened after a later check finds the outcome wrong.
+            (S::Completed, S::Running) => true,
+            // A person answered and handed the task back.
+            (S::HandedOff(_), S::Running) => true,
             _ => false,
         }
     }
@@ -249,25 +221,22 @@ impl TaskState {
 pub struct TransitionError {
     pub from: &'static str,
     pub to: &'static str,
-    pub detail: String,
 }
 
 impl fmt::Display for TransitionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Illegal state transition {} -> {}: {}",
-            self.from, self.to, self.detail
-        )
+        write!(f, "illegal state transition {} -> {}", self.from, self.to)
     }
 }
 
 impl std::error::Error for TransitionError {}
 
-/// External task record with private `state` and optimistic-concurrency `version`.
+/// A task as stored outside the model. `state` and `version` are private: the state moves
+/// only through `transition`, and the store bumps `version` on every write so a stale copy
+/// can never overwrite a newer one.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskRecord {
-    pub task_id: String,
+    pub task_id: TaskId,
     pub idempotency_trigger_key: String,
     pub task_type: String,
     pub config_version: String,
@@ -277,6 +246,9 @@ pub struct TaskRecord {
     pub authorized_markets: Vec<String>,
     state: TaskState,
     version: i64,
+    /// When the task last entered RUNNING. The wall-clock limit counts agent working time
+    /// from here, so time spent waiting for a person does not use it up.
+    pub running_since_epoch_s: Option<i64>,
     pub turns_used: u32,
     pub spend: UsdCents,
     pub retries_used: u32,
@@ -286,8 +258,9 @@ pub struct TaskRecord {
 }
 
 impl TaskRecord {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_queued(
-        task_id: impl Into<String>,
+        task_id: TaskId,
         idempotency_trigger_key: impl Into<String>,
         task_type: impl Into<String>,
         config_version: impl Into<String>,
@@ -296,8 +269,8 @@ impl TaskRecord {
         trigger_source: impl Into<String>,
         authorized_markets: Vec<String>,
     ) -> Result<Self, SchemaError> {
-        let rec = Self {
-            task_id: task_id.into(),
+        let task = Self {
+            task_id,
             idempotency_trigger_key: idempotency_trigger_key.into(),
             task_type: task_type.into(),
             config_version: config_version.into(),
@@ -307,6 +280,7 @@ impl TaskRecord {
             authorized_markets,
             state: TaskState::Queued,
             version: 1,
+            running_since_epoch_s: None,
             turns_used: 0,
             spend: UsdCents::ZERO,
             retries_used: 0,
@@ -314,53 +288,19 @@ impl TaskRecord {
             reworks_used: 0,
             reopened_count: 0,
         };
-        rec.validate()?;
-        Ok(rec)
+        task.validate()?;
+        Ok(task)
     }
 
-    /// Rehydrate a persisted `TaskRecord` from DB row columns (used only by repository layer).
-    #[allow(clippy::too_many_arguments)]
-    pub fn rehydrate_from_db(
-        task_id: String,
-        idempotency_trigger_key: String,
-        task_type: String,
-        config_version: String,
-        requester_id: String,
-        acting_principal: String,
-        trigger_source: String,
-        authorized_markets: Vec<String>,
-        state: TaskState,
-        version: i64,
-        turns_used: u32,
-        spend: UsdCents,
-        retries_used: u32,
-        consecutive_denials: u32,
-        reworks_used: u32,
-        reopened_count: u32,
-    ) -> Result<Self, SchemaError> {
+    /// Put back the state and version of a row read from the database. Only the store calls
+    /// this; it skips the transition check because the row is already persisted.
+    pub fn restored(mut self, state: TaskState, version: i64) -> Result<Self, SchemaError> {
         if version < 1 {
-            return Err(SchemaError(format!("invalid task version {version} < 1")));
+            return Err(SchemaError(format!("invalid task version {version}")));
         }
-        let rec = Self {
-            task_id,
-            idempotency_trigger_key,
-            task_type,
-            config_version,
-            requester_id,
-            acting_principal,
-            trigger_source,
-            authorized_markets,
-            state,
-            version,
-            turns_used,
-            spend,
-            retries_used,
-            consecutive_denials,
-            reworks_used,
-            reopened_count,
-        };
-        rec.validate()?;
-        Ok(rec)
+        self.state = state;
+        self.version = version;
+        Ok(self)
     }
 
     pub fn state(&self) -> &TaskState {
@@ -371,34 +311,60 @@ impl TaskRecord {
         self.version
     }
 
-    /// Advance in-memory version ONLY after the DB `UPDATE ... WHERE version = expected` succeeds.
-    pub fn advance_persisted_version(&mut self, new_version: i64) {
-        self.version = new_version;
+    /// Called by the store after its `UPDATE ... WHERE version = expected` succeeded.
+    pub fn set_persisted_version(&mut self, version: i64) {
+        self.version = version;
     }
 
-    /// The ONLY way to mutate `self.state`. Validates Diagram 4a's transition matrix!
-    pub fn transition(&mut self, next: TaskState) -> Result<(), TransitionError> {
-        if let TaskState::OutcomeUnknown { frozen_action_key } = &next {
-            if frozen_action_key.trim().is_empty() {
-                return Err(TransitionError {
-                    from: self.state.code(),
-                    to: next.code(),
-                    detail: "OutcomeUnknown requires non-empty frozen_action_key".into(),
-                });
+    /// The only way to change the state. `now_epoch_s` is an input, not read from a clock,
+    /// so this stays a pure function.
+    pub fn transition(&mut self, next: TaskState, now_epoch_s: i64) -> Result<(), TransitionError> {
+        let illegal = TransitionError {
+            from: self.state.code(),
+            to: next.code(),
+        };
+        if !self.state.can_transition(&next) {
+            return Err(illegal);
+        }
+        if let TaskState::OutcomeUnknown { frozen_action_key } = &next
+            && frozen_action_key.trim().is_empty()
+        {
+            return Err(illegal);
+        }
+        if matches!(next, TaskState::Running) {
+            if !matches!(self.state, TaskState::Running) {
+                self.running_since_epoch_s = Some(now_epoch_s);
+            }
+            // Back to work after verification, settlement or completion is a rework.
+            if matches!(
+                self.state,
+                TaskState::Verifying | TaskState::Settling(_) | TaskState::Completed
+            ) {
+                self.reworks_used += 1;
+            }
+            if matches!(self.state, TaskState::Completed) {
+                self.reopened_count += 1;
             }
         }
-        if !self.state.can_transition(&next) {
-            return Err(TransitionError {
-                from: self.state.code(),
-                to: next.code(),
-                detail: "violates Diagram 4a state transition table".into(),
-            });
-        }
-        if matches!(self.state, TaskState::Completed) && matches!(next, TaskState::Running) {
-            self.reopened_count = self.reopened_count.saturating_add(1);
-            self.reworks_used = self.reworks_used.saturating_add(1);
-        }
         self.state = next;
+        Ok(())
+    }
+
+    /// Give the current wait a new owner and deadline without changing the state, as when
+    /// a hand-off is not taken up in time and passes to the next person.
+    pub fn reassign_wait(
+        &mut self,
+        owner_id: impl Into<String>,
+        deadline_epoch_s: i64,
+    ) -> Result<(), SchemaError> {
+        let wait = match &mut self.state {
+            TaskState::AwaitingInput(w)
+            | TaskState::AwaitingApproval(w)
+            | TaskState::Settling(w)
+            | TaskState::HandedOff(w) => w,
+            other => return Err(SchemaError(format!("{} has no wait", other.code()))),
+        };
+        *wait = WaitMetadata::new(owner_id, deadline_epoch_s, wait.timeout_action)?;
         Ok(())
     }
 
@@ -417,183 +383,169 @@ impl TaskRecord {
     }
 }
 
-// --- Compile-Time Type-State Lifecycle Phases ---
-
-#[derive(Debug, Clone, Copy)]
-pub struct PhaseQueued;
-#[derive(Debug, Clone, Copy)]
-pub struct PhaseFramed;
-#[derive(Debug, Clone, Copy)]
-pub struct PhaseSettling;
-#[derive(Debug, Clone, Copy)]
-pub struct PhaseCompleted;
-
-#[derive(Debug, Clone)]
-pub struct TypedTask<Phase> {
-    record: TaskRecord,
-    _phase: PhantomData<Phase>,
-}
-
-impl<Phase> TypedTask<Phase> {
-    pub fn record(&self) -> &TaskRecord {
-        &self.record
-    }
-
-    pub fn into_record(self) -> TaskRecord {
-        self.record
-    }
-}
-
-impl TypedTask<PhaseQueued> {
-    pub fn from_queued(record: TaskRecord) -> Result<Self, SchemaError> {
-        if !matches!(record.state(), TaskState::Queued) {
-            return Err(SchemaError(format!(
-                "Expected QUEUED state, got {}",
-                record.state().code()
-            )));
-        }
-        Ok(Self {
-            record,
-            _phase: PhantomData,
-        })
-    }
-
-    pub fn into_framed(mut self) -> Result<TypedTask<PhaseFramed>, TransitionError> {
-        self.record.transition(TaskState::Running)?;
-        Ok(TypedTask {
-            record: self.record,
-            _phase: PhantomData,
-        })
-    }
-}
-
-impl TypedTask<PhaseFramed> {
-    pub fn from_verifying(record: TaskRecord) -> Result<Self, SchemaError> {
-        if !matches!(record.state(), TaskState::Verifying) {
-            return Err(SchemaError(format!(
-                "Expected VERIFYING state, got {}",
-                record.state().code()
-            )));
-        }
-        Ok(Self {
-            record,
-            _phase: PhantomData,
-        })
-    }
-
-    pub fn into_settling(
-        mut self,
-        confirm_wait: WaitMetadata,
-    ) -> Result<TypedTask<PhaseSettling>, TransitionError> {
-        self.record.transition(TaskState::Settling(confirm_wait))?;
-        Ok(TypedTask {
-            record: self.record,
-            _phase: PhantomData,
-        })
-    }
-}
-
-impl TypedTask<PhaseSettling> {
-    pub fn into_completed(mut self) -> Result<TypedTask<PhaseCompleted>, TransitionError> {
-        self.record.transition(TaskState::Completed)?;
-        Ok(TypedTask {
-            record: self.record,
-            _phase: PhantomData,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::contracts::{ActionIntentStatus, ApprovalStatus, RiskTier, TaskTypeConfig, AutonomyLevel, BudgetLimits, ShapeLevel};
-    use crate::types::sha256_hex;
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
-    #[test]
-    fn sha256_via_sha2_matches_nist() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn wait() -> WaitMetadata {
+        WaitMetadata::new("owner", 1, TimeoutAction::HandOff).unwrap()
+    }
+
+    fn reason() -> String {
+        "r".into()
+    }
+
+    /// One example of every state, in Diagram 4a order.
+    fn all_states() -> Vec<TaskState> {
+        vec![
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::AwaitingInput(wait()),
+            TaskState::AwaitingApproval(wait()),
+            TaskState::OutcomeUnknown {
+                frozen_action_key: IdempotencyKey::new("k"),
+            },
+            TaskState::LimitReached { reason: reason() },
+            TaskState::Verifying,
+            TaskState::Settling(wait()),
+            TaskState::Completed,
+            TaskState::Failed { reason: reason() },
+            TaskState::HandedOff(wait()),
+            TaskState::Declined { reason: reason() },
+            TaskState::Cancelled { reason: reason() },
+        ]
+    }
+
+    /// Diagram 4a written out edge by edge, independent of `can_transition`.
+    fn diagram_edges() -> BTreeSet<(&'static str, &'static str)> {
+        let mut edges = BTreeSet::new();
+        let rows: [(&str, &[&str]); 11] = [
+            ("QUEUED", &["RUNNING", "FAILED"]),
+            (
+                "RUNNING",
+                &[
+                    "AWAITING_INPUT",
+                    "AWAITING_APPROVAL",
+                    "OUTCOME_UNKNOWN",
+                    "LIMIT_REACHED",
+                    "VERIFYING",
+                    "FAILED",
+                ],
+            ),
+            ("AWAITING_INPUT", &["RUNNING"]),
+            ("AWAITING_APPROVAL", &["RUNNING", "DECLINED"]),
+            ("OUTCOME_UNKNOWN", &["RUNNING"]),
+            ("LIMIT_REACHED", &["RUNNING", "VERIFYING"]),
+            ("VERIFYING", &["RUNNING", "SETTLING", "FAILED"]),
+            ("SETTLING", &["COMPLETED", "RUNNING"]),
+            ("COMPLETED", &["RUNNING"]),
+            ("HANDED_OFF", &["RUNNING"]),
+            ("FAILED", &[]),
+        ];
+        for (from, tos) in rows {
+            for to in tos {
+                edges.insert((from, *to));
+            }
+        }
+        let working = [
+            "QUEUED",
+            "RUNNING",
+            "AWAITING_INPUT",
+            "AWAITING_APPROVAL",
+            "OUTCOME_UNKNOWN",
+            "LIMIT_REACHED",
+            "VERIFYING",
+            "SETTLING",
+        ];
+        for from in working {
+            edges.insert((from, "HANDED_OFF"));
+            if from != "OUTCOME_UNKNOWN" {
+                edges.insert((from, "CANCELLED"));
+            }
+        }
+        edges
     }
 
     #[test]
-    fn diagram_4a_transitions_and_private_state_enforced() {
-        let mut t = TaskRecord::new_queued(
-            "T-1",
-            "trig-1",
+    fn transition_table_matches_diagram_4a_exactly() {
+        let expected = diagram_edges();
+        for from in all_states() {
+            for to in all_states() {
+                let edge = (from.code(), to.code());
+                assert_eq!(
+                    from.can_transition(&to),
+                    expected.contains(&edge),
+                    "{} -> {}",
+                    edge.0,
+                    edge.1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_codes_are_errors() {
+        assert!(TaskState::from_db_parts("BOGUS", None, None).is_err());
+        assert!(TaskState::from_db_parts("SETTLING", None, None).is_err());
+        assert!(TimeoutAction::from_db_str("LATER").is_err());
+    }
+
+    fn new_task() -> TaskRecord {
+        TaskRecord::new_queued(
+            TaskId::new("T-1"),
+            "trigger",
             "rebalance",
-            "1.0",
+            "1",
             "alice",
             "svc",
             "cron",
             vec!["US".into()],
         )
-        .unwrap();
-        assert_eq!(t.state().code(), "QUEUED");
-        assert_eq!(t.version(), 1);
-
-        // Illegal jump QUEUED -> COMPLETED must fail!
-        assert!(t.transition(TaskState::Completed).is_err());
-
-        // Legal path: QUEUED -> RUNNING -> OUTCOME_UNKNOWN -> RUNNING -> VERIFYING -> SETTLING -> COMPLETED
-        t.transition(TaskState::Running).unwrap();
-        t.transition(TaskState::OutcomeUnknown {
-            frozen_action_key: "act-1".into(),
-        })
-        .unwrap();
-        // Cannot jump OUTCOME_UNKNOWN -> VERIFYING without reconciling first!
-        assert!(t.transition(TaskState::Verifying).is_err());
-        t.transition(TaskState::Running).unwrap();
-        t.transition(TaskState::Verifying).unwrap();
-        let wm = WaitMetadata::new("alice", "2099-01-01T00:00:00Z", "escalate").unwrap();
-        t.transition(TaskState::Settling(wm)).unwrap();
-        t.transition(TaskState::Completed).unwrap();
-        assert_eq!(t.reopened_count, 0);
-
-        // Reopen COMPLETED -> RUNNING increments reopened_count & reworks_used
-        t.transition(TaskState::Running).unwrap();
-        assert_eq!(t.reopened_count, 1);
-        assert_eq!(t.reworks_used, 1);
-
-        // Terminal state DECLINED blocks all outgoing transitions
-        t.transition(TaskState::Declined {
-            reason: "rejected".into(),
-        })
-        .unwrap();
-        assert!(t.transition(TaskState::Running).is_err());
+        .unwrap()
     }
 
-    #[test]
-    fn unknown_status_strings_error_instead_of_defaulting_to_failed() {
-        assert!(TaskState::from_db_parts("BOGUS_STATE", None, None).is_err());
-        assert!(ActionIntentStatus::from_db_str("GARBAGE").is_err());
-        assert!(ApprovalStatus::from_db_str("MAYBE").is_err());
-        assert_eq!(
-            ActionIntentStatus::from_db_str("DISPATCHED").unwrap(),
-            ActionIntentStatus::Dispatched
-        );
-    }
-
-    #[test]
-    fn diagram_3a_unlisted_tool_is_none_and_r4_exists() {
-        let mut allowed = BTreeMap::new();
-        allowed.insert("submit_paper_orders".into(), RiskTier::R3);
-        allowed.insert("direct_wire_transfer".into(), RiskTier::R4);
-        let cfg = TaskTypeConfig {
-            task_type: "t".into(),
-            version: "1".into(),
-            shape_level: ShapeLevel::MultiAgent,
-            shape_rationale: "r".into(),
-            autonomy_level: AutonomyLevel::PerActionApproval,
-            config_admin_id: "admin".into(),
-            allowed_tools: allowed,
-            budget_limits: BudgetLimits::default(),
-            done_criteria: vec!["ok".into()],
-        };
-        assert_eq!(cfg.lookup_tool_risk("unlisted_tool"), None);
-        assert_eq!(cfg.lookup_tool_risk("submit_paper_orders"), Some(RiskTier::R3));
-        assert_eq!(cfg.lookup_tool_risk("direct_wire_transfer"), Some(RiskTier::R4));
+    proptest! {
+        /// Random walks through the machine never break the invariants of Diagram 4a.
+        #[test]
+        fn random_walks_keep_diagram_invariants(choices in prop::collection::vec(0usize..13, 0..60)) {
+            let states = all_states();
+            let mut task = new_task();
+            let (mut reopen_moves, mut rework_moves) = (0, 0);
+            for (now, i) in choices.into_iter().enumerate() {
+                let from = task.state().clone();
+                let to = states[i].clone();
+                let legal = from.can_transition(&to);
+                prop_assert_eq!(task.transition(to.clone(), now as i64).is_ok(), legal);
+                if !legal {
+                    prop_assert_eq!(task.state(), &from);
+                    continue;
+                }
+                prop_assert!(!from.is_terminal(), "left terminal state {}", from.code());
+                match to.code() {
+                    "COMPLETED" => prop_assert_eq!(from.code(), "SETTLING"),
+                    "SETTLING" => prop_assert_eq!(from.code(), "VERIFYING"),
+                    "DECLINED" => prop_assert_eq!(from.code(), "AWAITING_APPROVAL"),
+                    "FAILED" => prop_assert!(from.code() != "OUTCOME_UNKNOWN"),
+                    _ => {}
+                }
+                if to.code() == "RUNNING" {
+                    if from.code() != "RUNNING" {
+                        prop_assert_eq!(task.running_since_epoch_s, Some(now as i64));
+                    }
+                    if matches!(from.code(), "VERIFYING" | "SETTLING" | "COMPLETED") {
+                        rework_moves += 1;
+                    }
+                    if from.code() == "COMPLETED" {
+                        reopen_moves += 1;
+                    }
+                }
+            }
+            prop_assert_eq!(task.reopened_count, reopen_moves);
+            prop_assert_eq!(task.reworks_used, rework_moves);
+        }
     }
 }

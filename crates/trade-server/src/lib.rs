@@ -1,14 +1,13 @@
 #![forbid(unsafe_code)]
-//! End-to-end governed research & paper-execution orchestration, concrete `Tool` adapters,
-//! DB-only `IndependentVerifier`, and multi-period PIT fixture dataset.
+//! The application: settings from files, the two governed tools, and the use cases that
+//! drive a task through Diagram 0. The HTTP interface and the command line sit on top.
 
-pub mod fixtures;
+pub mod config;
 pub mod tools;
 pub mod workflow;
 
-pub use fixtures::{rebalance_dates, seed_pit_universe, REBALANCE_DATE_STRS};
-pub use tools::{CreateRebalanceDraftTool, CredentialVault, SubmitPaperOrdersTool};
+pub use config::{ResearchParams, Strategy, load_task_types};
+pub use tools::{CreateDraft, DRAFT_TOOL, ORDER_TOOL, PortfolioFacts, SubmitOrders};
 pub use workflow::{
-    build_default_config, IndependentVerifier, ReconcileOutcome, ResearchRunOutput, TradeAiHarness,
-    VerifyOutcome,
+    FrameRequest, Framing, Harness, Intake, PAPER_BROKER_KEY, REBALANCE, Step, Verification,
 };

@@ -1,0 +1,517 @@
+{
+ "backtest": {
+  "overall": {
+   "annualized_return": 1.1595,
+   "annualized_volatility": 0.0323,
+   "avg_rank_ic": 0.1107,
+   "avg_turnover": 0.2083,
+   "cumulative_return": 0.2926,
+   "max_drawdown": 0.0,
+   "periods": 4,
+   "sharpe_ratio": 35.9151
+  },
+  "periods": [
+   {
+    "cost_drag": 0.0015,
+    "date": "2024-06-30",
+    "net_return": 0.069167,
+    "selected": [
+     "CAT_IND",
+     "AAPL_MOAT",
+     "MSFT_QUAL"
+    ],
+    "vetoed": [
+     "TRAP_CO",
+     "DEBT_FAIL"
+    ]
+   },
+   {
+    "cost_drag": 0.0,
+    "date": "2025-06-30",
+    "net_return": 0.076667,
+    "selected": [
+     "CAT_IND",
+     "MSFT_QUAL",
+     "AAPL_MOAT"
+    ],
+    "vetoed": [
+     "TRAP_CO",
+     "DEBT_FAIL"
+    ]
+   },
+   {
+    "cost_drag": 0.0,
+    "date": "2026-02-10",
+    "net_return": 0.065,
+    "selected": [
+     "CAT_IND",
+     "MSFT_QUAL",
+     "AAPL_MOAT"
+    ],
+    "vetoed": [
+     "TRAP_CO",
+     "DEBT_FAIL"
+    ]
+   },
+   {
+    "cost_drag": 0.001,
+    "date": "2026-05-01",
+    "net_return": 0.054333,
+    "selected": [
+     "CAT_IND",
+     "MSFT_QUAL",
+     "BRK_VAL"
+    ],
+    "vetoed": [
+     "TRAP_CO"
+    ]
+   }
+  ]
+ },
+ "capital_usd": 1000000,
+ "dates": {
+  "2024-06-30": {
+   "committee": {
+    "AAPL_MOAT": {
+     "consensus": 0.258,
+     "dispersion": 0.1778,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "BRK_VAL": {
+     "consensus": -0.16,
+     "dispersion": 0.3803,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "CAT_IND": {
+     "consensus": 0.705,
+     "dispersion": 0.2597,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "DEBT_FAIL": {
+     "consensus": -1.0,
+     "dispersion": 0.0,
+     "escalate": false,
+     "hard_veto": true
+    },
+    "MSFT_QUAL": {
+     "consensus": 0.1892,
+     "dispersion": 0.3563,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "TRAP_CO": {
+     "consensus": -0.5266,
+     "dispersion": 0.2637,
+     "escalate": false,
+     "hard_veto": true
+    }
+   },
+   "draft_status": "EXECUTED",
+   "escalated": [],
+   "quant": {
+    "AAPL_MOAT": {
+     "hard_veto": false,
+     "score": 0.25,
+     "veto_reasons": []
+    },
+    "BRK_VAL": {
+     "hard_veto": false,
+     "score": -0.5167,
+     "veto_reasons": []
+    },
+    "CAT_IND": {
+     "hard_veto": false,
+     "score": 0.775,
+     "veto_reasons": []
+    },
+    "DEBT_FAIL": {
+     "hard_veto": true,
+     "score": -1.0,
+     "veto_reasons": [
+      "distress_zscore(Z=0.37<1.80)",
+      "earnings_manipulation_risk(M=-1.60>-1.78,Acc=-0.014)",
+      "low_interest_coverage(IC=0.60<1.50)"
+     ]
+    },
+    "MSFT_QUAL": {
+     "hard_veto": false,
+     "score": 0.1667,
+     "veto_reasons": []
+    },
+    "TRAP_CO": {
+     "hard_veto": true,
+     "score": -0.3167,
+     "veto_reasons": [
+      "earnings_manipulation_risk(M=-1.20>-1.78,Acc=0.114)",
+      "negative_cfo_positive_ni"
+     ]
+    }
+   },
+   "universe": [
+    "AAPL_MOAT",
+    "BRK_VAL",
+    "CAT_IND",
+    "DEBT_FAIL",
+    "MSFT_QUAL",
+    "TRAP_CO"
+   ],
+   "vetoed": [
+    "DEBT_FAIL",
+    "TRAP_CO"
+   ],
+   "weights": {
+    "AAPL_MOAT": 0.2858,
+    "CAT_IND": 0.35,
+    "MSFT_QUAL": 0.2599
+   }
+  },
+  "2025-06-30": {
+   "committee": {
+    "AAPL_MOAT": {
+     "consensus": 0.3745,
+     "dispersion": 0.1064,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "BRK_VAL": {
+     "consensus": 0.1171,
+     "dispersion": 0.1851,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "CAT_IND": {
+     "consensus": 0.705,
+     "dispersion": 0.2597,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "DEBT_FAIL": {
+     "consensus": -1.0,
+     "dispersion": 0.0,
+     "escalate": false,
+     "hard_veto": true
+    },
+    "LATE_FILER": {
+     "consensus": -0.567,
+     "dispersion": 0.3664,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "MSFT_QUAL": {
+     "consensus": 0.3951,
+     "dispersion": 0.2767,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "TRAP_CO": {
+     "consensus": -0.5266,
+     "dispersion": 0.2637,
+     "escalate": false,
+     "hard_veto": true
+    }
+   },
+   "draft_status": "EXECUTED",
+   "escalated": [],
+   "quant": {
+    "AAPL_MOAT": {
+     "hard_veto": false,
+     "score": 0.3583,
+     "veto_reasons": []
+    },
+    "BRK_VAL": {
+     "hard_veto": false,
+     "score": 0.0,
+     "veto_reasons": []
+    },
+    "CAT_IND": {
+     "hard_veto": false,
+     "score": 0.775,
+     "veto_reasons": []
+    },
+    "DEBT_FAIL": {
+     "hard_veto": true,
+     "score": -1.0,
+     "veto_reasons": [
+      "distress_zscore(Z=0.37<1.80)",
+      "low_interest_coverage(IC=0.60<1.50)"
+     ]
+    },
+    "LATE_FILER": {
+     "hard_veto": false,
+     "score": -0.9583,
+     "veto_reasons": []
+    },
+    "MSFT_QUAL": {
+     "hard_veto": false,
+     "score": 0.425,
+     "veto_reasons": []
+    },
+    "TRAP_CO": {
+     "hard_veto": true,
+     "score": -0.3167,
+     "veto_reasons": [
+      "earnings_manipulation_risk(M=-1.20>-1.78,Acc=0.114)",
+      "negative_cfo_positive_ni"
+     ]
+    }
+   },
+   "universe": [
+    "AAPL_MOAT",
+    "BRK_VAL",
+    "CAT_IND",
+    "DEBT_FAIL",
+    "LATE_FILER",
+    "MSFT_QUAL",
+    "TRAP_CO"
+   ],
+   "vetoed": [
+    "DEBT_FAIL",
+    "TRAP_CO"
+   ],
+   "weights": {
+    "AAPL_MOAT": 0.294,
+    "CAT_IND": 0.35,
+    "MSFT_QUAL": 0.3009
+   }
+  },
+  "2026-02-10": {
+   "committee": {
+    "AAPL_MOAT": {
+     "consensus": 0.3293,
+     "dispersion": 0.3232,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "BRK_VAL": {
+     "consensus": 0.1957,
+     "dispersion": 0.2413,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "CAT_IND": {
+     "consensus": 0.7914,
+     "dispersion": 0.2125,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "DEBT_FAIL": {
+     "consensus": -1.0,
+     "dispersion": 0.0,
+     "escalate": false,
+     "hard_veto": true
+    },
+    "DISP_CORP": {
+     "consensus": 0.0958,
+     "dispersion": 0.4902,
+     "escalate": true,
+     "hard_veto": false
+    },
+    "LATE_FILER": {
+     "consensus": -0.5518,
+     "dispersion": 0.3502,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "MSFT_QUAL": {
+     "consensus": 0.4725,
+     "dispersion": 0.2583,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "TRAP_CO": {
+     "consensus": -0.5609,
+     "dispersion": 0.2378,
+     "escalate": false,
+     "hard_veto": true
+    }
+   },
+   "draft_status": "EXECUTED",
+   "escalated": [],
+   "quant": {
+    "AAPL_MOAT": {
+     "hard_veto": false,
+     "score": 0.2222,
+     "veto_reasons": []
+    },
+    "BRK_VAL": {
+     "hard_veto": false,
+     "score": 0.0,
+     "veto_reasons": []
+    },
+    "CAT_IND": {
+     "hard_veto": false,
+     "score": 0.85,
+     "veto_reasons": []
+    },
+    "DEBT_FAIL": {
+     "hard_veto": true,
+     "score": -1.0,
+     "veto_reasons": [
+      "distress_zscore(Z=0.37<1.80)",
+      "low_interest_coverage(IC=0.60<1.50)"
+     ]
+    },
+    "DISP_CORP": {
+     "hard_veto": false,
+     "score": 0.1611,
+     "veto_reasons": []
+    },
+    "LATE_FILER": {
+     "hard_veto": false,
+     "score": -0.925,
+     "veto_reasons": []
+    },
+    "MSFT_QUAL": {
+     "hard_veto": false,
+     "score": 0.3333,
+     "veto_reasons": []
+    },
+    "TRAP_CO": {
+     "hard_veto": true,
+     "score": -0.3917,
+     "veto_reasons": [
+      "earnings_manipulation_risk(M=-1.20>-1.78,Acc=0.114)",
+      "negative_cfo_positive_ni"
+     ]
+    }
+   },
+   "universe": [
+    "AAPL_MOAT",
+    "BRK_VAL",
+    "CAT_IND",
+    "DEBT_FAIL",
+    "DISP_CORP",
+    "LATE_FILER",
+    "MSFT_QUAL",
+    "TRAP_CO"
+   ],
+   "vetoed": [
+    "DEBT_FAIL",
+    "TRAP_CO"
+   ],
+   "weights": {
+    "AAPL_MOAT": 0.2681,
+    "CAT_IND": 0.35,
+    "MSFT_QUAL": 0.3144
+   }
+  },
+  "2026-05-01": {
+   "committee": {
+    "AAPL_MOAT": {
+     "consensus": 0.065,
+     "dispersion": 0.4989,
+     "escalate": true,
+     "hard_veto": false
+    },
+    "BRK_VAL": {
+     "consensus": 0.5603,
+     "dispersion": 0.1122,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "CAT_IND": {
+     "consensus": 0.4497,
+     "dispersion": 0.2403,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "DISP_CORP": {
+     "consensus": -0.1168,
+     "dispersion": 0.4274,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "LATE_FILER": {
+     "consensus": 0.4725,
+     "dispersion": 0.2794,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "MSFT_QUAL": {
+     "consensus": 0.2083,
+     "dispersion": 0.4187,
+     "escalate": false,
+     "hard_veto": false
+    },
+    "TRAP_CO": {
+     "consensus": -0.8969,
+     "dispersion": 0.1515,
+     "escalate": false,
+     "hard_veto": true
+    }
+   },
+   "draft_status": "EXECUTED",
+   "escalated": [],
+   "quant": {
+    "AAPL_MOAT": {
+     "hard_veto": false,
+     "score": -0.1556,
+     "veto_reasons": []
+    },
+    "BRK_VAL": {
+     "hard_veto": false,
+     "score": 0.6583,
+     "veto_reasons": []
+    },
+    "CAT_IND": {
+     "hard_veto": false,
+     "score": 0.2417,
+     "veto_reasons": []
+    },
+    "DISP_CORP": {
+     "hard_veto": false,
+     "score": -0.1278,
+     "veto_reasons": []
+    },
+    "LATE_FILER": {
+     "hard_veto": false,
+     "score": 0.1944,
+     "veto_reasons": []
+    },
+    "MSFT_QUAL": {
+     "hard_veto": false,
+     "score": -0.0444,
+     "veto_reasons": []
+    },
+    "TRAP_CO": {
+     "hard_veto": true,
+     "score": -1.0,
+     "veto_reasons": [
+      "earnings_manipulation_risk(M=-1.20>-1.78,Acc=0.114)",
+      "negative_cfo_positive_ni"
+     ]
+    }
+   },
+   "universe": [
+    "AAPL_MOAT",
+    "BRK_VAL",
+    "CAT_IND",
+    "DISP_CORP",
+    "LATE_FILER",
+    "MSFT_QUAL",
+    "TRAP_CO"
+   ],
+   "vetoed": [
+    "TRAP_CO"
+   ],
+   "weights": {
+    "BRK_VAL": 0.35,
+    "CAT_IND": 0.3184,
+    "LATE_FILER": 0.3261
+   }
+  }
+ },
+ "markets": [
+  "US"
+ ],
+ "max_positions": 3,
+ "source": "trade_ai@f47db05",
+ "survivorship_exercise": {
+  "artificial_gain_pct_points": 31.7,
+  "survivor_bias_free_return": -0.2667,
+  "survivors_only_return": 0.05
+ }
+}

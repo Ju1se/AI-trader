@@ -1,14 +1,17 @@
 #![forbid(unsafe_code)]
-//! Core domain types, Diagram 4a 13-state machine with private state & transition table,
-//! Diagram 3a R0-R4 risk tiers, algebraic PreDispatch vs PostDispatchUnknown errors,
-//! `sha2` payload hashing, and `serde` contracts.
+//! Pure domain core: typed IDs, the Diagram 4a state machine, Diagram 3a risk tiers,
+//! contracts, errors and the read-only data ports. No IO and no async.
 
 pub mod contracts;
 pub mod errors;
+pub mod ids;
+pub mod ports;
 pub mod state;
 pub mod types;
 
 pub use contracts::*;
 pub use errors::*;
+pub use ids::*;
+pub use ports::*;
 pub use state::*;
 pub use types::*;

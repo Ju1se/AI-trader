@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ApprovalId, IdempotencyKey, TaskId};
 use crate::state::TaskState;
 use crate::types::{
-    require_non_empty, sha256_hex, AsOfDate, FilingDate, PeriodEndDate, SchemaError, UsdCents,
-    WeightBps,
+    AsOfDate, FilingDate, PeriodEndDate, SchemaError, UsdCents, WeightBps, require_non_empty,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +154,35 @@ pub struct TaskTypeConfig {
     pub allowed_tools: BTreeMap<String, RiskTier>,
     pub budget_limits: BudgetLimits,
     pub done_criteria: Vec<String>,
+    #[serde(default)]
+    pub waits: WaitPolicy,
+}
+
+/// How long each kind of wait may last, and who takes over when nobody acts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WaitPolicy {
+    pub input_ttl_s: i64,
+    pub approval_ttl_s: i64,
+    pub settle_window_s: i64,
+    pub handoff_ack_ttl_s: i64,
+    pub approver_role: String,
+    pub escalation_owner_id: String,
+    pub backup_owner_id: String,
+}
+
+impl Default for WaitPolicy {
+    fn default() -> Self {
+        Self {
+            input_ttl_s: 48 * 3_600,
+            approval_ttl_s: 24 * 3_600,
+            settle_window_s: 72 * 3_600,
+            handoff_ack_ttl_s: 4 * 3_600,
+            approver_role: "portfolio_approver".into(),
+            escalation_owner_id: "risk_committee_lead".into(),
+            backup_owner_id: "operations_on_call".into(),
+        }
+    }
 }
 
 impl TaskTypeConfig {
@@ -174,9 +203,9 @@ impl TaskTypeConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskContract {
-    pub task_id: String,
+    pub task_id: TaskId,
     pub goal: String,
     pub as_of_date: AsOfDate,
     pub universe_markets: Vec<String>,
@@ -185,6 +214,9 @@ pub struct TaskContract {
     pub expected_outputs: Vec<String>,
     pub done_checks: Vec<String>,
     pub assumptions: Vec<String>,
+    /// Whether the task may finish without its irreversible (R3) step. If so, a refused
+    /// approval for that step sends the task back to work to deliver what it has; if not,
+    /// the refusal ends the task as DECLINED (Diagram 3b).
     pub irreversible_steps_deferred: bool,
 }
 
@@ -230,7 +262,10 @@ impl AgentEvidenceOutput {
         require_non_empty(&self.ticker, "ticker")?;
         require_non_empty(&self.agent, "agent")?;
         if !self.score.is_finite() || !(-1.0..=1.0).contains(&self.score) {
-            return Err(SchemaError(format!("score {} outside [-1.0, 1.0]", self.score)));
+            return Err(SchemaError(format!(
+                "score {} outside [-1.0, 1.0]",
+                self.score
+            )));
         }
         if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
             return Err(SchemaError(format!(
@@ -245,7 +280,9 @@ impl AgentEvidenceOutput {
             )));
         }
         if self.evidence.is_empty() {
-            return Err(SchemaError("evidence must contain at least one item".into()));
+            return Err(SchemaError(
+                "evidence must contain at least one item".into(),
+            ));
         }
         Ok(())
     }
@@ -285,27 +322,6 @@ impl PortfolioActionPayload {
     }
 }
 
-#[derive(Serialize)]
-struct HashEnvelope<'a> {
-    args: &'a PortfolioActionPayload,
-    target: &'a str,
-    tool_name: &'a str,
-}
-
-pub fn compute_action_payload_hash(
-    tool_name: &str,
-    target: &str,
-    payload: &PortfolioActionPayload,
-) -> Result<String, SchemaError> {
-    let canonical = serde_json::to_string(&HashEnvelope {
-        args: payload,
-        target,
-        tool_name,
-    })
-    .map_err(|e| SchemaError(e.to_string()))?;
-    Ok(sha256_hex(canonical.as_bytes()))
-}
-
 /// DB-managed approval lifecycle status (`PENDING -> APPROVED | REJECTED -> CONSUMED | EXPIRED`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalStatus {
@@ -337,6 +353,24 @@ impl ApprovalStatus {
             other => Err(SchemaError(format!("unknown_approval_status:{other}"))),
         }
     }
+}
+
+/// One approval request and its decision. Only the store creates or changes it; the gate
+/// reads it from the store, never from the proposer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRecord {
+    pub approval_id: ApprovalId,
+    pub task_id: TaskId,
+    pub requester_id: String,
+    pub tool_name: String,
+    pub target: String,
+    /// Hash of tool, target and canonical arguments: the approval covers exactly this.
+    pub payload_hash: String,
+    pub args_json: String,
+    pub status: ApprovalStatus,
+    pub approver_id: Option<String>,
+    pub decision_note: Option<String>,
+    pub expires_at_epoch_s: i64,
 }
 
 /// Diagram 3b / Requirement #3: Action status includes `Dispatched`, and rejects unknown strings!
@@ -377,8 +411,8 @@ impl ActionIntentStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionIntentRecord {
-    pub idempotency_key: String,
-    pub task_id: String,
+    pub idempotency_key: IdempotencyKey,
+    pub task_id: TaskId,
     pub tool_name: String,
     pub target: String,
     pub args_json: String,
@@ -405,9 +439,9 @@ impl Completeness {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryManifest {
-    pub task_id: String,
+    pub task_id: TaskId,
     pub final_state: TaskState,
     pub completeness: Completeness,
     pub criteria_results: BTreeMap<String, bool>,
@@ -419,9 +453,9 @@ pub struct DeliveryManifest {
     pub weights: BTreeMap<String, WeightBps>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffPackage {
-    pub task_id: String,
+    pub task_id: TaskId,
     pub requester_id: String,
     pub original_request: String,
     pub trigger_reason: String,
@@ -433,6 +467,8 @@ pub struct HandoffPackage {
     pub accepted_by_human: bool,
 }
 
+/// Everything public about one security on a given date. Forward returns are deliberately
+/// absent: the backtest gets them through `PitMarketSource::get_forward_returns`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PitSecuritySnapshot {
     pub ticker: String,
@@ -475,7 +511,6 @@ pub struct PitSecuritySnapshot {
     pub wacc: f64,
     pub trade_date: String,
     pub close_price: f64,
-    pub forward_1m_return: f64,
     pub adv_usd: f64,
     pub amihud_illiq: f64,
     pub momentum_12_1: f64,

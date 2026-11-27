@@ -1,302 +1,355 @@
-//! Concrete `trade_gate::Tool` implementations for rebalance draft creation (`R2`)
-//! and standalone paper broker order submission (`R3`).
-//! Authoritative veto lists and draft records are ALWAYS fetched from `DbStore` — never from callers.
+//! The two governed write tools: the rebalance draft (R2) and paper orders (R3).
+//!
+//! Business rules are checked against facts the store holds (the stored veto list and the
+//! stored draft), never against what the proposer sends. Each tool also knows how to read
+//! its target system back by idempotency key, which is how recovery settles an action whose
+//! outcome was unknown.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
-use trade_adapters::PaperBrokerAdapter;
+use trade_adapters::{BrokerOrderReceipt, PaperBroker};
 use trade_core::{
-    PortfolioActionPayload, PreDispatchError, RiskTier, TaskRecord,
+    ActionIntentRecord, ExecError, GateError, IdempotencyKey, PortfolioActionPayload,
+    PreDispatchError, RiskTier, TaskId, TaskRecord, UsdCents,
 };
-use trade_gate::{Tool, VerifiedGateTicket};
-use trade_store::DbStore;
+use trade_gate::{DispatchResult, Tool, VerifiedGateTicket};
+use trade_store::{Store, StoredDraft};
 
-/// Isolated secret store residing outside worker crates (`Agent 7` 2.3).
-#[derive(Clone, Default)]
-pub struct CredentialVault {
-    secrets: BTreeMap<String, String>,
+pub const DRAFT_TOOL: &str = "create_rebalance_draft";
+pub const ORDER_TOOL: &str = "submit_paper_orders";
+
+/// A backstop independent of the strategy settings: no single position above 45%.
+const MAX_POSITION_BPS: u16 = 4_500;
+
+/// What the portfolio rules are checked against, read from the store.
+#[derive(Debug, Clone, Default)]
+pub struct PortfolioFacts {
+    pub evaluated: BTreeSet<String>,
+    pub vetoed: BTreeSet<String>,
+    /// The stored draft the orders must match. Read only for orders.
+    pub draft: Option<StoredDraft>,
 }
 
-impl CredentialVault {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn set_secret(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.secrets.insert(name.into(), value.into());
-    }
-
-    pub fn get_secret(&self, name: &str) -> Option<&str> {
-        self.secrets.get(name).map(|s| s.as_str())
-    }
+async fn load_portfolio_facts(
+    store: &Store,
+    task: &TaskRecord,
+    draft_id: Option<&str>,
+) -> Result<PortfolioFacts, GateError> {
+    let decisions = store.evaluations(&task.task_id).await?;
+    let draft = match draft_id {
+        Some(id) => store.draft(id).await?,
+        None => None,
+    };
+    Ok(PortfolioFacts {
+        evaluated: decisions.iter().map(|d| d.ticker.clone()).collect(),
+        vetoed: decisions
+            .iter()
+            .filter(|d| d.hard_veto)
+            .map(|d| d.ticker.clone())
+            .collect(),
+        draft,
+    })
 }
 
-fn check_common_portfolio_bounds(
+fn check_portfolio(
     args: &PortfolioActionPayload,
     task: &TaskRecord,
+    facts: &PortfolioFacts,
 ) -> Result<(), PreDispatchError> {
+    use PreDispatchError::{BusinessRuleViolation as Rule, InvalidArguments, UnauthorizedMarket};
     if args.draft_id.trim().is_empty() {
-        return Err(PreDispatchError::InvalidArguments("empty_draft_id".into()));
+        return Err(InvalidArguments("empty_draft_id".into()));
     }
     if args.markets.is_empty() {
-        return Err(PreDispatchError::InvalidArguments("empty_markets".into()));
+        return Err(InvalidArguments("empty_markets".into()));
     }
-    for mkt in &args.markets {
-        if !task.authorized_markets.contains(mkt) {
-            return Err(PreDispatchError::UnauthorizedMarket(mkt.clone()));
-        }
+    if let Some(market) = args
+        .markets
+        .iter()
+        .find(|m| !task.authorized_markets.contains(m))
+    {
+        return Err(UnauthorizedMarket(market.clone()));
     }
     let total_bps: u32 = args.weights_bps.values().map(|w| u32::from(w.bps())).sum();
     if total_bps > 10_000 {
-        return Err(PreDispatchError::BusinessRuleViolation(
-            "total_weight_exceeds_100pct".into(),
-        ));
+        return Err(Rule("total_weight_exceeds_100pct".into()));
     }
-    if args.weights_bps.values().any(|w| w.bps() > 4_500) {
-        return Err(PreDispatchError::BusinessRuleViolation(
-            "single_position_exceeds_45pct_cap".into(),
-        ));
+    if args
+        .weights_bps
+        .values()
+        .any(|w| w.bps() > MAX_POSITION_BPS)
+    {
+        return Err(Rule("single_position_exceeds_45pct_cap".into()));
+    }
+    if facts.evaluated.is_empty() {
+        return Err(Rule("missing_db_security_evaluations".into()));
+    }
+    for ticker in args.weights_bps.keys() {
+        if !facts.evaluated.contains(ticker) {
+            return Err(Rule(format!("unevaluated_ticker:{ticker}")));
+        }
+        if facts.vetoed.contains(ticker) {
+            return Err(Rule(format!("vetoed_ticker_in_portfolio:{ticker}")));
+        }
     }
     Ok(())
 }
 
-/// R2 reversible write tool: persists a rebalance draft after verifying against DB veto list.
-pub struct CreateRebalanceDraftTool<'a> {
-    pub store: &'a DbStore,
+fn canonical(args: &PortfolioActionPayload) -> Result<String, PreDispatchError> {
+    args.to_canonical_json()
+        .map_err(|e| PreDispatchError::InvalidArguments(e.0))
 }
 
-impl<'a> Tool for CreateRebalanceDraftTool<'a> {
-    type Args = PortfolioActionPayload;
-    type Receipt = String;
+fn payload_of(action: &ActionIntentRecord) -> Result<PortfolioActionPayload, GateError> {
+    serde_json::from_str(&action.args_json)
+        .map_err(|e| GateError::Storage(format!("corrupt_action_args:{e}")))
+}
 
-    fn name(&self) -> &str {
-        "create_rebalance_draft"
+/// R2: write the rebalance draft. Reversible, so it needs approval only when the task
+/// type's autonomy level asks for it.
+pub struct CreateDraft {
+    pub store: Store,
+}
+
+impl CreateDraft {
+    fn matches(draft: &StoredDraft, task_id: &TaskId, args: &PortfolioActionPayload) -> bool {
+        &draft.task_id == task_id
+            && draft.as_of_date == args.as_of_date
+            && draft.weights == args.weights_bps
     }
 
-    fn risk_tier(&self) -> RiskTier {
+    /// Read the store back for an action whose outcome is unknown.
+    pub async fn reconcile(
+        &self,
+        action: &ActionIntentRecord,
+    ) -> Result<DispatchResult, GateError> {
+        let args = payload_of(action)?;
+        Ok(match self.store.draft(&args.draft_id).await? {
+            Some(d) if Self::matches(&d, &action.task_id, &args) => DispatchResult::Verified {
+                receipt_id: d.draft_id,
+            },
+            Some(_) => DispatchResult::Unknown {
+                receipt_id: Some(args.draft_id),
+                detail: "stored_draft_differs".into(),
+            },
+            None => DispatchResult::NotSent {
+                detail: "no_draft_stored".into(),
+            },
+        })
+    }
+}
+
+impl Tool for CreateDraft {
+    type Args = PortfolioActionPayload;
+    type Facts = PortfolioFacts;
+
+    fn name(&self) -> &str {
+        DRAFT_TOOL
+    }
+
+    fn min_tier(&self) -> RiskTier {
         RiskTier::R2
     }
 
-    fn canonical_args_json(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
-        args.to_canonical_json()
-            .map_err(|e| PreDispatchError::InvalidArguments(e.0))
+    fn canonical_args(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
+        canonical(args)
     }
 
-    fn validate_args(
+    async fn load_facts(
+        &self,
+        task: &TaskRecord,
+        _: &Self::Args,
+    ) -> Result<Self::Facts, GateError> {
+        load_portfolio_facts(&self.store, task, None).await
+    }
+
+    fn check(
         &self,
         args: &Self::Args,
         task: &TaskRecord,
+        facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
-        check_common_portfolio_bounds(args, task)
-    }
-
-    async fn check_business_rules(
-        &self,
-        args: &Self::Args,
-        task: &TaskRecord,
-    ) -> Result<(), PreDispatchError> {
-        // Requirement #2: Read authoritative evaluations & hard-veto list directly from DB!
-        let evals = self
-            .store
-            .get_stored_evaluations(&task.task_id)
-            .await
-            .map_err(|e| PreDispatchError::CheckFailed(e.to_string()))?;
-        if evals.is_empty() {
-            return Err(PreDispatchError::BusinessRuleViolation(
-                "missing_db_security_evaluations".into(),
-            ));
-        }
-        for ticker in args.weights_bps.keys() {
-            let Some(ev) = evals.get(ticker) else {
-                return Err(PreDispatchError::BusinessRuleViolation(format!(
-                    "unevaluated_ticker:{ticker}"
-                )));
-            };
-            if ev.hard_veto {
-                return Err(PreDispatchError::BusinessRuleViolation(format!(
-                    "vetoed_ticker_in_portfolio:{ticker}"
-                )));
-            }
-        }
-        Ok(())
+        check_portfolio(args, task, facts)
     }
 
     async fn execute(
         &self,
         ticket: &VerifiedGateTicket,
-        task_id: &str,
-        _idempotency_key: &str,
+        task_id: &TaskId,
+        _: &IdempotencyKey,
         args: &Self::Args,
-    ) -> Result<Self::Receipt, String> {
+    ) -> Result<String, ExecError> {
+        // A local insert either happened or it did not.
         self.store
-            .write_rebalance_draft(ticket, task_id, args)
+            .write_draft(ticket, task_id, args)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| ExecError::NotSent(e.to_string()))
     }
 
-    async fn readback_verify(
-        &self,
-        args: &Self::Args,
-        receipt: &Self::Receipt,
-    ) -> Result<bool, String> {
-        let rb = self
-            .store
-            .readback_rebalance_draft(receipt)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(rb.is_some_and(|d| d.weights == args.weights_bps))
-    }
-
-    async fn rehydrate_verified_receipt(
-        &self,
-        receipt_id: &str,
-    ) -> Result<Option<Self::Receipt>, String> {
-        let rb = self
-            .store
-            .readback_rebalance_draft(receipt_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(rb.map(|d| d.draft_id))
+    async fn readback(&self, args: &Self::Args, receipt_id: &str) -> Result<(), String> {
+        match self.store.draft(receipt_id).await {
+            Ok(Some(draft)) if draft.weights == args.weights_bps => Ok(()),
+            Ok(Some(_)) => Err("stored_weights_differ".into()),
+            Ok(None) => Err("draft_missing".into()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 
-/// R3 consequential order submission tool (`Diagram 3a`: 下单归 R3) backed by standalone `PaperBrokerAdapter`.
-pub struct SubmitPaperOrdersTool<'a> {
-    pub store: &'a DbStore,
-    pub broker: &'a PaperBrokerAdapter,
-    pub vault: &'a CredentialVault,
+/// R3: place the paper orders for the stored draft. Always needs a person's approval.
+pub struct SubmitOrders {
+    pub store: Store,
+    pub broker: PaperBroker,
+    /// Held outside every worker and model; `None` means the credential is missing.
+    pub api_key: Option<String>,
 }
 
-impl<'a> Tool for SubmitPaperOrdersTool<'a> {
+impl SubmitOrders {
+    /// The broker shows exactly the requested orders: same tickers, weights and amounts.
+    fn matches(receipt: &BrokerOrderReceipt, args: &PortfolioActionPayload) -> Result<(), String> {
+        if receipt.status != "FILLED" {
+            return Err(format!("order_status:{}", receipt.status));
+        }
+        let capital = args
+            .portfolio_capital_cents
+            .unwrap_or(UsdCents::ZERO)
+            .cents() as i128;
+        let expected: Vec<(String, u16, i64)> = args
+            .weights_bps
+            .iter()
+            .map(|(t, w)| {
+                (
+                    t.clone(),
+                    w.bps(),
+                    (capital * i128::from(w.bps()) / 10_000) as i64,
+                )
+            })
+            .collect();
+        let filled: Vec<(String, u16, i64)> = receipt
+            .orders
+            .iter()
+            .map(|o| {
+                (
+                    o.ticker.clone(),
+                    o.weight_bps.bps(),
+                    o.notional_cents.cents(),
+                )
+            })
+            .collect();
+        if filled != expected {
+            return Err(format!(
+                "orders_differ:expected={expected:?},filled={filled:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ask the broker, by idempotency key, what happened to an action whose outcome is
+    /// unknown.
+    pub async fn reconcile(
+        &self,
+        action: &ActionIntentRecord,
+    ) -> Result<DispatchResult, GateError> {
+        let args = payload_of(action)?;
+        Ok(
+            match self
+                .broker
+                .get_order_by_idempotency(&action.idempotency_key)
+            {
+                Some(receipt) => match Self::matches(&receipt, &args) {
+                    Ok(()) => DispatchResult::Verified {
+                        receipt_id: receipt.receipt_id,
+                    },
+                    Err(detail) => DispatchResult::Unknown {
+                        receipt_id: Some(receipt.receipt_id),
+                        detail,
+                    },
+                },
+                None => DispatchResult::NotSent {
+                    detail: "broker_has_no_order".into(),
+                },
+            },
+        )
+    }
+}
+
+impl Tool for SubmitOrders {
     type Args = PortfolioActionPayload;
-    type Receipt = String;
+    type Facts = PortfolioFacts;
 
     fn name(&self) -> &str {
-        "submit_paper_orders"
+        ORDER_TOOL
     }
 
-    fn risk_tier(&self) -> RiskTier {
+    fn min_tier(&self) -> RiskTier {
         RiskTier::R3
     }
 
-    fn canonical_args_json(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
-        args.to_canonical_json()
-            .map_err(|e| PreDispatchError::InvalidArguments(e.0))
+    fn canonical_args(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
+        canonical(args)
     }
 
-    fn validate_args(
+    async fn load_facts(
+        &self,
+        task: &TaskRecord,
+        args: &Self::Args,
+    ) -> Result<Self::Facts, GateError> {
+        load_portfolio_facts(&self.store, task, Some(&args.draft_id)).await
+    }
+
+    fn check(
         &self,
         args: &Self::Args,
         task: &TaskRecord,
+        facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
-        check_common_portfolio_bounds(args, task)?;
+        check_portfolio(args, task, facts)?;
         if args.portfolio_capital_cents.is_none_or(|c| c.cents() <= 0) {
             return Err(PreDispatchError::InvalidArguments(
                 "missing_or_non_positive_portfolio_capital".into(),
             ));
         }
-        Ok(())
-    }
-
-    async fn check_business_rules(
-        &self,
-        args: &Self::Args,
-        task: &TaskRecord,
-    ) -> Result<(), PreDispatchError> {
-        // Requirement #2: Re-verify both DB veto list AND stored draft weights from DB!
-        let evals = self
-            .store
-            .get_stored_evaluations(&task.task_id)
-            .await
-            .map_err(|e| PreDispatchError::CheckFailed(e.to_string()))?;
-        if evals.is_empty() {
-            return Err(PreDispatchError::BusinessRuleViolation(
-                "missing_db_security_evaluations".into(),
-            ));
-        }
-        for ticker in args.weights_bps.keys() {
-            let Some(ev) = evals.get(ticker) else {
-                return Err(PreDispatchError::BusinessRuleViolation(format!(
-                    "unevaluated_ticker:{ticker}"
-                )));
-            };
-            if ev.hard_veto {
-                return Err(PreDispatchError::BusinessRuleViolation(format!(
-                    "vetoed_ticker_in_portfolio:{ticker}"
-                )));
-            }
-        }
-        let draft = self
-            .store
-            .readback_rebalance_draft(&args.draft_id)
-            .await
-            .map_err(|e| PreDispatchError::CheckFailed(e.to_string()))?
-            .ok_or_else(|| {
-                PreDispatchError::BusinessRuleViolation(format!(
-                    "draft_not_found:{}",
-                    args.draft_id
-                ))
-            })?;
-        if draft.task_id != task.task_id || draft.weights != args.weights_bps {
-            return Err(PreDispatchError::BusinessRuleViolation(
-                "order_weights_diverge_from_stored_draft".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn check_pre_dispatch_ready(&self) -> Result<(), PreDispatchError> {
-        if self.vault.get_secret("paper_broker_api_key").is_none() {
-            return Err(PreDispatchError::MissingCredential(
+        match &facts.draft {
+            None => Err(PreDispatchError::BusinessRuleViolation(format!(
+                "draft_not_found:{}",
+                args.draft_id
+            ))),
+            Some(d) if !CreateDraft::matches(d, &task.task_id, args) => Err(
+                PreDispatchError::BusinessRuleViolation("orders_differ_from_stored_draft".into()),
+            ),
+            Some(_) if self.api_key.is_none() => Err(PreDispatchError::MissingCredential(
                 "paper_broker_api_key".into(),
-            ));
+            )),
+            Some(_) => Ok(()),
         }
-        Ok(())
     }
 
     async fn execute(
         &self,
-        _ticket: &VerifiedGateTicket,
-        task_id: &str,
-        idempotency_key: &str,
+        _: &VerifiedGateTicket,
+        task_id: &TaskId,
+        key: &IdempotencyKey,
         args: &Self::Args,
-    ) -> Result<Self::Receipt, String> {
-        let api_key = self
-            .vault
-            .get_secret("paper_broker_api_key")
-            .ok_or_else(|| "missing_paper_broker_api_key".to_string())?;
-        let cap = args
-            .portfolio_capital_cents
-            .ok_or_else(|| "missing_capital".to_string())?;
-        let receipt = self.broker.submit_orders(
-            api_key,
-            idempotency_key,
-            task_id,
-            &args.as_of_date,
-            cap,
-            &args.weights_bps,
-        )?;
-        Ok(receipt.receipt_id)
+    ) -> Result<String, ExecError> {
+        let api_key = self.api_key.as_deref().unwrap_or_default();
+        let capital = args.portfolio_capital_cents.unwrap_or(UsdCents::ZERO);
+        self.broker
+            .submit_orders(
+                api_key,
+                key,
+                task_id,
+                &args.as_of_date,
+                capital,
+                &args.weights_bps,
+            )
+            .map(|receipt| receipt.receipt_id)
     }
 
-    async fn readback_verify(
-        &self,
-        args: &Self::Args,
-        receipt: &Self::Receipt,
-    ) -> Result<bool, String> {
-        let Some(order) = self.broker.get_order_by_receipt(receipt) else {
-            return Ok(false);
-        };
-        Ok(order.status == "FILLED" && order.orders.len() == args.weights_bps.len())
-    }
-
-    async fn rehydrate_verified_receipt(
-        &self,
-        receipt_id: &str,
-    ) -> Result<Option<Self::Receipt>, String> {
-        Ok(self
+    async fn readback(&self, args: &Self::Args, receipt_id: &str) -> Result<(), String> {
+        let receipt = self
             .broker
             .get_order_by_receipt(receipt_id)
-            .map(|o| o.receipt_id))
+            .ok_or_else(|| "order_missing".to_string())?;
+        Self::matches(&receipt, args)
     }
 }

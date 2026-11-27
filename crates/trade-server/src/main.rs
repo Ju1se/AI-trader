@@ -1,107 +1,159 @@
 #![forbid(unsafe_code)]
-//! CLI entrypoint (`demo`, `backtest`, `research`, `bench`) with item-by-item parity
-//! against `v0.1-python-mvp` across factor scores, vetoes, weights, and backtest metrics.
+//! Command line: `trade <demo|backtest|research|bench> [--db URL] [--as-of DATE] [--root DIR]`.
+//! The numbers match the Python MVP (`v0.1-python-mvp`) item by item.
 
 use std::collections::BTreeMap;
-use std::env;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 
-use trade_server::{
-    build_default_config, rebalance_dates, seed_pit_universe, TradeAiHarness,
-};
-use trade_core::{AsOfDate, AutonomyLevel, UsdCents};
-use trade_gate::GateOutcome;
-use trade_quant::{
-    audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe, BacktestConfig,
-};
-use trade_store::DbStore;
+use trade_core::{ActionIntentStatus, AsOfDate, PitMarketSource, TaskId};
+use trade_quant::{audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe};
+use trade_server::{FrameRequest, Framing, Harness, Intake, ORDER_TOOL, Step};
 
-fn print_header(title: &str) {
-    println!("\n{}", "=".repeat(76));
-    println!("{title}");
-    println!("{}", "=".repeat(76));
+struct Args {
+    command: String,
+    db: String,
+    as_of: String,
+    root: PathBuf,
 }
 
-async fn run_demo(db_url: &str) -> Result<(), String> {
-    let store = DbStore::connect(db_url).await.map_err(|e| e.to_string())?;
-    seed_pit_universe(&store).await.map_err(|e| e.to_string())?;
+fn parse_args() -> Args {
+    let mut args = std::env::args().skip(1);
+    let mut parsed = Args {
+        command: "demo".into(),
+        db: ":memory:".into(),
+        as_of: "2026-02-10".into(),
+        root: PathBuf::new(),
+    };
+    let mut root = None;
+    let mut first = true;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--db" => parsed.db = args.next().unwrap_or_default(),
+            "--as-of" => parsed.as_of = args.next().unwrap_or_default(),
+            "--root" => root = args.next().map(PathBuf::from),
+            command if first => parsed.command = command.into(),
+            _ => {}
+        }
+        first = false;
+    }
+    // The repository root: where config/ and fixtures/ are.
+    parsed.root = root.unwrap_or_else(|| {
+        if Path::new("config/strategy.toml").exists() {
+            PathBuf::from(".")
+        } else {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+        }
+    });
+    parsed
+}
 
-    print_header("1. Backtesting Pitfalls, Per-Date Factor Scores, Vetoes & Metrics");
+fn section(title: &str) {
+    println!("\n{}\n{title}\n{}", "=".repeat(76), "=".repeat(76));
+}
+
+fn err(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
+fn ratios(weights: &BTreeMap<String, trade_core::WeightBps>) -> BTreeMap<&str, f64> {
+    weights
+        .iter()
+        .map(|(t, w)| (t.as_str(), w.as_ratio()))
+        .collect()
+}
+
+fn intake(trigger_key: &str, h: &Harness) -> Intake {
+    Intake {
+        trigger_key: trigger_key.into(),
+        requester_id: "pm_alice".into(),
+        acting_principal: "quant_research_svc".into(),
+        trigger_source: "monthly_cron".into(),
+        markets: h.strategy.markets.clone(),
+    }
+}
+
+fn frame_request(as_of: &str, h: &Harness) -> FrameRequest {
+    FrameRequest {
+        goal: format!(
+            "Point-in-time value and quality screen and a governed rebalance for {as_of}"
+        ),
+        as_of_date: Some(as_of.into()),
+        markets: h.strategy.markets.clone(),
+        portfolio_capital: Some(h.strategy.research.portfolio_capital),
+        max_positions: h.strategy.research.max_positions,
+        orders_optional: true,
+    }
+}
+
+/// ADMIT and FRAME a rebalance task for `as_of`.
+async fn start(h: &Harness, trigger_key: &str, as_of: &str) -> Result<TaskId, String> {
+    let (task, _) = h.admit(&intake(trigger_key, h)).await.map_err(err)?;
+    match h
+        .frame(&task.task_id, &frame_request(as_of, h))
+        .await
+        .map_err(err)?
+    {
+        Framing::Ready(_) => Ok(task.task_id),
+        Framing::NeedsInput(questions) => Err(format!("request is ambiguous: {questions:?}")),
+    }
+}
+
+fn backtest_section(h: &Harness) -> Result<(), String> {
+    let s = &h.strategy;
+    section("1. Backtesting pitfalls, factor scores and vetoes per date, backtest metrics");
     let ex = audit_survivorship_bias_exercise();
     println!(
-        "Textbook Exercise -> Survivors Only: {:.1}%, Survivor-Bias-Free: {:.1}%, Artificial Gain: +{:.1} pct points",
+        "Textbook exercise -> survivors only: {:.1}%, survivor-bias-free: {:.1}%, artificial gain: +{:.1} pct points",
         ex.survivors_only_return * 100.0,
         ex.survivor_bias_free_return * 100.0,
         ex.artificial_gain_pct_points
     );
-
-    let dates = rebalance_dates();
-    let markets = vec!["US".to_string()];
-    for dt in &dates {
-        let snap = store
-            .get_pit_snapshot(dt, &markets)
-            .await
-            .map_err(|e| e.to_string())?;
-        let scored = score_pit_universe(&snap, dt, 1_000_000.0);
-        println!("\n  --- Factor Scores & Vetoes @ {} ---", dt.as_str());
-        for r in &scored {
+    for date in &s.rebalance_dates {
+        let snapshot = h.market.get_pit_snapshot(date, &s.markets)?;
+        println!("\n  --- Factor scores and vetoes @ {} ---", date.as_str());
+        for r in score_pit_universe(&snapshot, date, &s.factors) {
             println!(
                 "    {:<10} | Quant={:+.4} | Alpha={:+.4} | Pen={:.4} | Veto={:<5} | Reasons={:?}",
                 r.ticker, r.quant_score, r.alpha_score, r.risk_penalty, r.hard_veto, r.veto_reasons
             );
         }
     }
-
-    let pit_source = store
-        .preload_backtest_source(&dates, &markets)
-        .await
-        .map_err(|e| e.to_string())?;
-    let bt = run_pit_backtest(
-        &pit_source,
-        &dates,
-        BacktestConfig {
-            markets: markets.clone(),
-            oos_start_date: Some(AsOfDate::new("2026-02-10").unwrap()),
-            ..Default::default()
-        },
-    )?;
-
+    let bt = run_pit_backtest(&h.market, &s.rebalance_dates, &s.backtest, &s.factors)?;
+    let o = &bt.overall;
     println!(
-        "\nPIT Backtest Overall -> Periods={}, CumRet={:.2}%, AnnRet={:.2}%, Vol={:.2}%, Sharpe={:.2}, MaxDD={:.2}%, AvgTurnover={:.2}%, AvgRankIC={:.4}",
-        bt.overall.periods,
-        bt.overall.cumulative_return * 100.0,
-        bt.overall.annualized_return * 100.0,
-        bt.overall.annualized_volatility * 100.0,
-        bt.overall.sharpe_ratio,
-        bt.overall.max_drawdown * 100.0,
-        bt.overall.avg_turnover * 100.0,
-        bt.overall.avg_rank_ic.unwrap_or(0.0)
+        "\nPIT backtest overall -> periods={}, cum={:.2}%, ann={:.2}%, vol={:.2}%, sharpe={:.2}, maxDD={:.2}%, turnover={:.2}%, rankIC={:.4}",
+        o.periods,
+        o.cumulative_return * 100.0,
+        o.annualized_return * 100.0,
+        o.annualized_volatility * 100.0,
+        o.sharpe_ratio,
+        o.max_drawdown * 100.0,
+        o.avg_turnover * 100.0,
+        o.avg_rank_ic.unwrap_or(0.0)
     );
-    if let (Some(is_m), Some(oos_m)) = (&bt.in_sample, &bt.out_of_sample) {
-        println!(
-            "  In-Sample     -> CumRet={:.2}%, Sharpe={:.2}, AvgTurnover={:.2}%, AvgRankIC={:.4}",
-            is_m.cumulative_return * 100.0,
-            is_m.sharpe_ratio,
-            is_m.avg_turnover * 100.0,
-            is_m.avg_rank_ic.unwrap_or(0.0)
-        );
-        println!(
-            "  Out-of-Sample -> CumRet={:.2}%, Sharpe={:.2}, AvgTurnover={:.2}%, AvgRankIC={:.4}",
-            oos_m.cumulative_return * 100.0,
-            oos_m.sharpe_ratio,
-            oos_m.avg_turnover * 100.0,
-            oos_m.avg_rank_ic.unwrap_or(0.0)
-        );
+    for (name, m) in [
+        ("In-sample", &bt.in_sample),
+        ("Out-of-sample", &bt.out_of_sample),
+    ] {
+        if let Some(m) = m {
+            println!(
+                "  {name:<13} -> cum={:.2}%, sharpe={:.2}, turnover={:.2}%, rankIC={:.4}",
+                m.cumulative_return * 100.0,
+                m.sharpe_ratio,
+                m.avg_turnover * 100.0,
+                m.avg_rank_ic.unwrap_or(0.0)
+            );
+        }
     }
     for p in &bt.periods {
-        let w_json = serde_json::to_string(&p.weights).unwrap();
         println!(
-            "  [{}] Selected={:?} Vetoed={:?} Weights={} Turnover={:.2}% GrossRet={:.4}% Cost={:.4}% NetRet={:.2}% RankIC={:?}",
+            "  [{}] selected={:?} vetoed={:?} weights={} turnover={:.2}% gross={:.4}% cost={:.4}% net={:.2}% rankIC={:?}",
             p.rebalance_date.as_str(),
             p.selected_tickers,
             p.vetoed_tickers,
-            w_json,
+            serde_json::to_string(&p.weights).map_err(err)?,
             p.turnover * 100.0,
             p.gross_return * 100.0,
             p.cost_drag * 100.0,
@@ -109,99 +161,74 @@ async fn run_demo(db_url: &str) -> Result<(), String> {
             p.rank_ic
         );
     }
+    Ok(())
+}
 
-    print_header("2. Agent 7 Governed Workflow (DB-Backed Approvals & Diagram 4a States)");
-    let config = build_default_config(AutonomyLevel::PerActionApproval, "platform_admin", None);
-    let harness = TradeAiHarness::new(config);
-
-    let (task, dedup) = harness
-        .admit_task(
-            &store,
-            "sched-rebalance-2026-02-10",
-            "pm_alice",
-            "quant_research_svc",
-            "monthly_cron",
-            &markets,
-        )
+/// Approve the pending action as a second person and run on.
+async fn approve(h: &Harness, step: Step, tier: &str, note: &str) -> Result<Step, String> {
+    let Step::NeedsApproval { approval_id, tool } = step else {
+        return Err(format!("expected an approval request, got {step:?}"));
+    };
+    let approval = h
+        .store
+        .approval(&approval_id)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(err)?
+        .ok_or("approval missing")?;
     println!(
-        "ADMIT -> task_id={}, state={}, version={}, deduplicated={dedup}",
+        "ACT ({tier} {tool}) -> needs approval, approval_id={approval_id}, payload_hash={}...",
+        &approval.payload_hash[..16]
+    );
+    let task = h
+        .decide_approval(&approval_id, "approver_bob", true, Some(note))
+        .await
+        .map_err(err)?;
+    let step = h.advance(&task.task_id).await.map_err(err)?;
+    println!("ACT ({tier} {tool}) -> approved by approver_bob, used once, executed");
+    Ok(step)
+}
+
+async fn demo(h: &Harness) -> Result<(), String> {
+    backtest_section(h)?;
+
+    section("2. Governed workflow (Diagrams 0, 3a, 3b and 4a)");
+    let (task, created) = h
+        .admit(&intake("sched-rebalance-2026-02-10", h))
+        .await
+        .map_err(err)?;
+    println!(
+        "ADMIT -> task_id={}, state={}, version={}, deduplicated={}",
         task.task_id,
         task.state().code(),
-        task.version()
+        task.version(),
+        !created
     );
-
-    let framed_res = harness
-        .frame_task(
-            &store,
-            &task.task_id,
-            "Run PIT value+quality screen and build governed rebalance draft for 2026-02-10",
-            Some("2026-02-10"),
-            &markets,
-            Some(UsdCents::from_dollars(1_000_000.0)),
-            3,
-        )
+    let Framing::Ready(contract) = h
+        .frame(&task.task_id, &frame_request("2026-02-10", h))
         .await
-        .map_err(|e| e.to_string())?;
-    let (_framed, contract) = framed_res.map_err(|t| format!("unexpected pause: {:?}", t.state()))?;
-    let loaded_running = store.get_task(&task.task_id).await.unwrap().unwrap();
+        .map_err(err)?
+    else {
+        return Err("unexpected request for input".into());
+    };
+    let framed = h.task(&task.task_id).await.map_err(err)?;
     println!(
         "FRAME -> state={}, version={}, as_of={}, capital=${:.0}",
-        loaded_running.state().code(),
-        loaded_running.version(),
+        framed.state().code(),
+        framed.version(),
         contract.as_of_date.as_str(),
         contract.portfolio_capital.to_dollars()
     );
+    let step = h.advance(&task.task_id).await.map_err(err)?;
+    let step = approve(
+        h,
+        step,
+        "R2",
+        "Approved R2 draft after reviewing committee dispersion",
+    )
+    .await?;
 
-    let audit = vec!["TRAP_CO".to_string()];
-    let res = harness
-        .run_research_and_draft(&store, &task.task_id, None, &audit, 8, 1_000_000.0, None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let draft_approval_id = match res.gate_outcome.as_ref().unwrap() {
-        GateOutcome::NeedsApproval {
-            approval_id,
-            payload_hash,
-            risk_tier,
-        } => {
-            println!(
-                "ACT (R2 Draft Gate) -> status=NEEDS_APPROVAL, tier={}, approval_id={approval_id}, payload_hash={}...",
-                risk_tier.as_str(),
-                &payload_hash[..16]
-            );
-            approval_id.clone()
-        }
-        other => return Err(format!("expected NeedsApproval, got {other:?}")),
-    };
-
-    // Approver separately approves in DB (`PENDING -> APPROVED`); Gate consumes by `approval_id`!
-    store
-        .decide_approval(
-            &draft_approval_id,
-            "approver_bob",
-            true,
-            Some("Approved R2 draft after reviewing committee dispersion"),
-            &harness.config.config_admin_id,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let draft_exec = harness
-        .submit_rebalance_draft(&store, &task.task_id, &res, Some(&draft_approval_id))
-        .await
-        .map_err(|e| e.to_string())?;
-    let draft_id = match draft_exec {
-        GateOutcome::Executed { receipt, .. } => {
-            println!("ACT (R2 Draft Approved & Consumed) -> status=EXECUTED, draft_id={receipt}");
-            receipt
-        }
-        other => return Err(format!("expected Executed, got {other:?}")),
-    };
-
-    print_header("3. Investment Committee Decision Table (2026-02-10)");
-    for d in &res.decisions {
+    section("3. Investment committee decisions (2026-02-10)");
+    for d in h.store.evaluations(&task.task_id).await.map_err(err)? {
         println!(
             "  {:<10} | Quant={:+.3} | Consensus={:+.3} | Disp={:.3} | Veto={:<5} | Escalate={:<5}",
             d.ticker,
@@ -212,238 +239,111 @@ async fn run_demo(db_url: &str) -> Result<(), String> {
             d.escalate_review
         );
     }
-    let display_weights: BTreeMap<&str, f64> = res
-        .payload
-        .weights_bps
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_ratio()))
-        .collect();
+    let (_, portfolio) = h.proposal(&task.task_id).await.map_err(err)?;
     println!(
-        "Target Weights: {}",
-        serde_json::to_string(&display_weights).unwrap()
+        "Target weights: {}",
+        serde_json::to_string(&ratios(&portfolio.weights)).map_err(err)?
     );
-    println!("Escalated in Selected Portfolio: {:?}", res.escalated);
     println!(
-        "Hard Vetoed (DB Source of Truth): {:?}",
-        res.vetoed.keys().collect::<Vec<_>>()
+        "Escalated in the selected portfolio: {:?}",
+        portfolio.escalated
+    );
+    println!(
+        "Hard vetoed (stored in the database): {:?}",
+        portfolio.vetoed.keys().collect::<Vec<_>>()
     );
 
-    print_header("4. Consequential Action (R3 Paper Orders via Standalone Broker Adapter)");
-    let order_idem = format!("order:{}:2026-02-10", task.task_id);
-    let order_gate_1 = harness
-        .execute_paper_orders(&store, &task.task_id, &draft_id, &order_idem, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    let order_approval_id = match order_gate_1 {
-        GateOutcome::NeedsApproval {
-            approval_id,
-            risk_tier,
-            ..
-        } => {
+    section("4. Consequential action: R3 paper orders through the paper broker");
+    let step = approve(h, step, "R3", "Approved R3 paper order submission").await?;
+    for a in h.store.actions(&task.task_id).await.map_err(err)? {
+        if a.tool_name == ORDER_TOOL && a.status == ActionIntentStatus::Verified {
             println!(
-                "ACT (R3 Order Gate) -> status=NEEDS_APPROVAL, tier={}, approval_id={approval_id}",
-                risk_tier.as_str()
+                "Paper execution -> receipt_id={}, read back and verified",
+                a.backend_receipt_id.unwrap_or_default()
             );
-            approval_id
         }
-        other => return Err(format!("expected R3 NeedsApproval, got {other:?}")),
-    };
-
-    store
-        .decide_approval(
-            &order_approval_id,
-            "approver_bob",
-            true,
-            Some("Approved R3 paper order submission"),
-            &harness.config.config_admin_id,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let order_exec = harness
-        .execute_paper_orders(
-            &store,
-            &task.task_id,
-            &draft_id,
-            &order_idem,
-            Some(&order_approval_id),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    if let GateOutcome::Executed { receipt, .. } = order_exec {
-        println!(
-            "Paper Execution -> status=EXECUTED, receipt_id={receipt}, readback_verified=true"
-        );
     }
 
-    print_header("5. CLOSE -> DB-Only Independent Verification, SETTLING -> COMPLETED & Economics");
-    let verified = harness
-        .verify_and_close(&store, &task.task_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    section("5. CLOSE: independent verification, settlement and unit economics");
+    let Step::Delivered(manifest) = step else {
+        return Err(format!("expected a delivery, got {step:?}"));
+    };
     println!(
-        "Verify -> final_state={}, completeness={}, criteria={}",
-        verified.manifest.final_state.code(),
-        verified.manifest.completeness.as_str(),
-        serde_json::to_string(&verified.manifest.criteria_results).unwrap()
+        "Verify -> state={}, completeness={}, criteria={}",
+        manifest.final_state.code(),
+        manifest.completeness.as_str(),
+        serde_json::to_string(&manifest.criteria_results).map_err(err)?
     );
-
-    let settling_handle = verified
-        .settling_task
-        .ok_or_else(|| "verification failed unexpectedly".to_string())?;
-    let completed = harness
-        .confirm_settlement(&store, settling_handle, "pm_alice", 3.0)
+    let done = h
+        .confirm_settlement(&task.task_id, "pm_alice", 3.0)
         .await
-        .map_err(|e| e.to_string())?;
-    let econ = store
-        .calculate_unit_economics(12_000)
-        .await
-        .map_err(|e| e.to_string())?;
-    println!("Settled -> state={}", completed.record().state().code());
-    println!("Unit Economics -> {}", serde_json::to_string(&econ).unwrap());
+        .map_err(err)?;
+    println!("Settled -> state={}", done.state().code());
+    let economics = h.store.unit_economics(12_000).await.map_err(err)?;
+    println!(
+        "Unit economics -> {}",
+        serde_json::to_string(&economics).map_err(err)?
+    );
     Ok(())
 }
 
-async fn run_cli() -> Result<(), String> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let cmd = args.first().map(|s| s.as_str()).unwrap_or("demo");
-
-    let mut db_url = ":memory:".to_string();
-    let mut as_of_str = "2026-02-10".to_string();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--db" if i + 1 < args.len() => {
-                db_url = args[i + 1].clone();
-                i += 2;
-            }
-            "--as-of" if i + 1 < args.len() => {
-                as_of_str = args[i + 1].clone();
-                i += 2;
-            }
-            _ => i += 1,
-        }
-    }
-
-    match cmd {
-        "demo" => run_demo(&db_url).await,
+async fn run() -> Result<(), String> {
+    let args = parse_args();
+    let h = Harness::open(&args.root, &args.db).await?;
+    let s = &h.strategy;
+    match args.command.as_str() {
+        "demo" => demo(&h).await,
         "backtest" => {
-            let store = DbStore::connect(&db_url).await.map_err(|e| e.to_string())?;
-            seed_pit_universe(&store).await.map_err(|e| e.to_string())?;
-            let dates = rebalance_dates();
-            let markets = vec!["US".to_string()];
-            let src = store
-                .preload_backtest_source(&dates, &markets)
-                .await
-                .map_err(|e| e.to_string())?;
-            let bt = run_pit_backtest(
-                &src,
-                &dates,
-                BacktestConfig {
-                    markets,
-                    oos_start_date: Some(AsOfDate::new("2026-02-10").unwrap()),
-                    ..Default::default()
-                },
-            )?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "overall": bt.overall,
-                    "in_sample": bt.in_sample,
-                    "out_of_sample": bt.out_of_sample,
-                    "periods": bt.periods,
-                }))
-                .unwrap()
-            );
+            let bt = run_pit_backtest(&h.market, &s.rebalance_dates, &s.backtest, &s.factors)?;
+            let out = serde_json::json!({
+                "overall": bt.overall,
+                "in_sample": bt.in_sample,
+                "out_of_sample": bt.out_of_sample,
+                "periods": bt.periods,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).map_err(err)?);
             Ok(())
         }
         "research" => {
-            let store = DbStore::connect(&db_url).await.map_err(|e| e.to_string())?;
-            seed_pit_universe(&store).await.map_err(|e| e.to_string())?;
-            let harness = TradeAiHarness::new(build_default_config(
-                AutonomyLevel::DraftOnly,
-                "platform_admin",
-                None,
-            ));
-            let markets = vec!["US".to_string()];
-            let (task, _) = harness
-                .admit_task(&store, &format!("cli-{as_of_str}"), "cli_user", "cli_svc", "cli", &markets)
-                .await
-                .map_err(|e| e.to_string())?;
-            harness
-                .frame_task(
-                    &store,
-                    &task.task_id,
-                    "CLI PIT research",
-                    Some(&as_of_str),
-                    &markets,
-                    Some(UsdCents::from_dollars(1_000_000.0)),
-                    3,
-                )
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|_| "ambiguous cli parameters".to_string())?;
-            let res = harness
-                .run_research_and_draft(
-                    &store,
-                    &task.task_id,
-                    None,
-                    &["TRAP_CO".to_string()],
-                    8,
-                    1_000_000.0,
-                    None,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            let weights: BTreeMap<&str, f64> = res
-                .payload
-                .weights_bps
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_ratio()))
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "as_of_date": as_of_str,
-                    "weights": weights,
-                    "vetoed": res.vetoed,
-                    "escalated": res.escalated,
-                }))
-                .unwrap()
-            );
+            let task_id = start(&h, &format!("cli-{}", args.as_of), &args.as_of).await?;
+            let step = h.advance(&task_id).await.map_err(err)?;
+            let (_, portfolio) = h.proposal(&task_id).await.map_err(err)?;
+            let out = serde_json::json!({
+                "as_of_date": args.as_of,
+                "weights": ratios(&portfolio.weights),
+                "vetoed": portfolio.vetoed,
+                "escalated": portfolio.escalated,
+                "next_step": format!("{step:?}"),
+            });
+            println!("{}", serde_json::to_string_pretty(&out).map_err(err)?);
             Ok(())
         }
         "bench" => {
-            let store = DbStore::connect(":memory:").await.map_err(|e| e.to_string())?;
-            seed_pit_universe(&store).await.map_err(|e| e.to_string())?;
-            let dt = AsOfDate::new("2026-02-10").unwrap();
-            let snap = store
-                .get_pit_snapshot(&dt, &["US".to_string()])
-                .await
-                .map_err(|e| e.to_string())?;
-            let iters = 2_000;
-            let t0 = Instant::now();
-            for _ in 0..iters {
-                let _ = score_pit_universe(&snap, &dt, 1_000_000.0);
+            let date = AsOfDate::new(args.as_of.as_str()).map_err(|e| e.0)?;
+            let snapshot = h.market.get_pit_snapshot(&date, &s.markets)?;
+            let iterations = 2_000;
+            let started = Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(score_pit_universe(&snapshot, &date, &s.factors));
             }
-            let elapsed = t0.elapsed();
+            let elapsed = started.elapsed().as_secs_f64();
             println!(
-                "Rust 15-Factor Cross-Sectional Engine -> {iters} iterations in {:.2} ms ({:.1} us/iter)",
-                elapsed.as_secs_f64() * 1000.0,
-                (elapsed.as_secs_f64() * 1_000_000.0) / (iters as f64)
+                "15-factor cross-sectional engine -> {iterations} iterations in {:.2} ms ({:.1} us each)",
+                elapsed * 1_000.0,
+                elapsed * 1_000_000.0 / f64::from(iterations)
             );
             Ok(())
         }
         other => Err(format!(
-            "Unknown command {other:?}. Usage: trade <demo|backtest|research|bench>"
+            "unknown command {other:?}; usage: trade <demo|backtest|research|bench> [--db URL] [--as-of DATE] [--root DIR]"
         )),
     }
 }
 
 #[tokio::main]
 async fn main() {
-    if let Err(err) = run_cli().await {
-        eprintln!("error: {err}");
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
         process::exit(1);
     }
 }

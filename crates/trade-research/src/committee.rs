@@ -3,28 +3,57 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use trade_core::{AgentEvidenceOutput, CommitteeDecision, UsdCents, WeightBps};
 use trade_quant::QuantSecurityResult;
 
 use crate::ReadOnlyPitView;
 
+/// Committee weights, escalation rule and portfolio limits. Loaded from
+/// `config/strategy.toml`, so trying other values needs no recompilation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct InvestmentCommittee {
     pub weights: BTreeMap<String, f64>,
+    /// Escalate a security to a person when the agents disagree more than this.
     pub dispersion_threshold: f64,
+    /// ...but only if the consensus is above this score.
+    pub escalation_consensus_floor: f64,
+    pub max_single_weight: WeightBps,
+    pub max_industry_weight: WeightBps,
+    /// Largest share of a security's average daily volume one position may take.
+    pub max_adv_participation: f64,
 }
 
 impl Default for InvestmentCommittee {
     fn default() -> Self {
-        let mut weights = BTreeMap::new();
-        weights.insert("quant".into(), 0.45);
-        weights.insert("moat".into(), 0.20);
-        weights.insert("management_capalloc".into(), 0.15);
-        weights.insert("footnote_forensics".into(), 0.20);
+        let weights = [
+            ("quant", 0.45),
+            ("moat", 0.20),
+            ("management_capalloc", 0.15),
+            ("footnote_forensics", 0.20),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
         Self {
             weights,
             dispersion_threshold: 0.45,
+            escalation_consensus_floor: -0.10,
+            max_single_weight: WeightBps::new(3_500).expect("valid bps"),
+            max_industry_weight: WeightBps::new(6_500).expect("valid bps"),
+            max_adv_participation: 0.10,
         }
     }
+}
+
+/// The committee's portfolio: target weights, the vetoed securities with their reasons, and
+/// the selected securities whose weight was halved pending a person's review.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TargetPortfolio {
+    pub weights: BTreeMap<String, WeightBps>,
+    pub vetoed: BTreeMap<String, Vec<String>>,
+    pub escalated: Vec<String>,
 }
 
 fn round4(v: f64) -> f64 {
@@ -41,7 +70,11 @@ impl InvestmentCommittee {
         let mut veto_reasons = quant.veto_reasons.clone();
         for out in &worker_outputs {
             if out.hard_veto {
-                veto_reasons.push(format!("{}_hard_veto:{}", out.agent, out.evidence.join(";")));
+                veto_reasons.push(format!(
+                    "{}_hard_veto:{}",
+                    out.agent,
+                    out.evidence.join(";")
+                ));
             }
         }
         let hard_veto = quant.hard_veto || worker_outputs.iter().any(|o| o.hard_veto);
@@ -69,8 +102,9 @@ impl InvestmentCommittee {
             (mean_s, var.max(0.0).sqrt())
         };
 
-        let escalate_review =
-            !hard_veto && dispersion > self.dispersion_threshold && consensus > -0.10;
+        let escalate_review = !hard_veto
+            && dispersion > self.dispersion_threshold
+            && consensus > self.escalation_consensus_floor;
 
         CommitteeDecision {
             ticker: quant.ticker.clone(),
@@ -85,21 +119,13 @@ impl InvestmentCommittee {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn build_target_weights(
         &self,
         decisions: &[CommitteeDecision],
         quant_by_ticker: &BTreeMap<String, QuantSecurityResult>,
         portfolio_capital: UsdCents,
         max_positions: usize,
-        max_single_weight: WeightBps,
-        max_industry_weight: WeightBps,
-        max_adv_participation: f64,
-    ) -> (
-        BTreeMap<String, WeightBps>,
-        BTreeMap<String, Vec<String>>,
-        Vec<String>,
-    ) {
+    ) -> TargetPortfolio {
         let mut vetoed: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for d in decisions {
             if d.hard_veto {
@@ -121,7 +147,11 @@ impl InvestmentCommittee {
         let mut weights: BTreeMap<String, WeightBps> = BTreeMap::new();
         let mut escalated_selected: Vec<String> = Vec::new();
         if chosen.is_empty() {
-            return (weights, vetoed, escalated_selected);
+            return TargetPortfolio {
+                weights,
+                vetoed,
+                escalated: escalated_selected,
+            };
         }
 
         let raw_scores: Vec<f64> = chosen
@@ -141,12 +171,13 @@ impl InvestmentCommittee {
             }
             let raw_bps = WeightBps::from_ratio_clamped(w_ratio).bps();
             let adv_bps =
-                WeightBps::from_ratio_clamped((max_adv_participation * q.adv_usd) / cap_usd).bps();
+                WeightBps::from_ratio_clamped((self.max_adv_participation * q.adv_usd) / cap_usd)
+                    .bps();
             let used_ind = industry_used_bps.get(&q.industry).copied().unwrap_or(0);
-            let rem_ind = max_industry_weight.bps().saturating_sub(used_ind);
+            let rem_ind = self.max_industry_weight.bps().saturating_sub(used_ind);
 
             let final_bps = raw_bps
-                .min(max_single_weight.bps())
+                .min(self.max_single_weight.bps())
                 .min(adv_bps)
                 .min(rem_ind);
             if final_bps > 0 {
@@ -163,6 +194,10 @@ impl InvestmentCommittee {
             }
         }
 
-        (weights, vetoed, escalated_selected)
+        TargetPortfolio {
+            weights,
+            vetoed,
+            escalated: escalated_selected,
+        }
     }
 }
