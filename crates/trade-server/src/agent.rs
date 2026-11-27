@@ -65,8 +65,12 @@ struct Proposal {
     args: Value,
 }
 
-/// The first JSON object in a reply; models sometimes wrap it in prose or a code fence.
+/// The first JSON object in a reply. Models sometimes wrap it in prose or a code fence, and
+/// reasoning models may think aloud first (`<think>...</think>`); that part is skipped.
 fn parse(reply: &str) -> Result<Proposal, String> {
+    let reply = reply
+        .rsplit_once("</think>")
+        .map_or(reply, |(_, answer)| answer);
     let (start, end) = (reply.find('{'), reply.rfind('}'));
     let (Some(start), Some(end)) = (start, end) else {
         return Err("no JSON object in the reply".into());
@@ -584,6 +588,8 @@ mod tests {
         let p = parse("Sure!\n```json\n{\"tool\": \"research\", \"args\": {}}\n```").unwrap();
         assert_eq!(p.tool, "research");
         assert!(parse("I will research now.").is_err());
+        let thought = "<think>maybe {\"tool\": \"screen\"}? no.</think>\n{\"tool\": \"research\"}";
+        assert_eq!(parse(thought).unwrap().tool, "research");
         assert!(parse("{\"args\": {}}").is_err());
         let weights =
             weights_arg(&serde_json::json!({"weights_bps": {"A": 2500, "B": 3500}})).unwrap();

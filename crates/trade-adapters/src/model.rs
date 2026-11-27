@@ -75,7 +75,8 @@ impl ChatModel {
             "model": self.model,
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 1024,
+            // Reasoning models think before they answer: leave room for both.
+            "max_tokens": 4096,
             "response_format": {"type": "json_object"},
         });
         let mut request = self.http.post(&self.endpoint).json(&body);
