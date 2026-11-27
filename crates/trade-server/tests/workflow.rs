@@ -19,8 +19,8 @@ fn state(task: &trade_core::TaskRecord) -> &'static str {
 #[tokio::test]
 async fn a_repeated_trigger_returns_the_same_task() {
     let h = common::harness().await;
-    let (first, created) = h.admit(&common::intake("cron-1")).await.unwrap();
-    let (again, created_again) = h.admit(&common::intake("cron-1")).await.unwrap();
+    let (first, created) = h.admit("cron-1", "pm_alice", "test").await.unwrap();
+    let (again, created_again) = h.admit("cron-1", "pm_alice", "test").await.unwrap();
     assert!(created && !created_again);
     assert_eq!(first.task_id, again.task_id);
 }
@@ -31,10 +31,10 @@ async fn a_repeated_trigger_returns_the_same_task() {
 async fn ambiguous_request_waits_for_an_answer_then_goes_to_a_person() {
     let h = common::harness().await;
     let waits = h.task_type.waits.clone();
-    let (task, _) = h.admit(&common::intake("ask")).await.unwrap();
+    let (task, _) = h.admit("ask", "pm_alice", "test").await.unwrap();
     let mut vague = common::request("2026-02-10", true);
     vague.as_of_date = None;
-    vague.portfolio_capital = None;
+    vague.portfolio_capital_usd = None;
     let framing = h.frame(&task.task_id, &vague).await.unwrap();
     assert_eq!(
         framing,
@@ -57,7 +57,7 @@ async fn ambiguous_request_waits_for_an_answer_then_goes_to_a_person() {
     assert!(matches!(answered, Framing::Ready(_)));
 
     // ...and never arrives on another.
-    let (silent, _) = h.admit(&common::intake("silent")).await.unwrap();
+    let (silent, _) = h.admit("silent", "pm_alice", "test").await.unwrap();
     h.frame(&silent.task_id, &vague).await.unwrap();
     h.store.advance_clock(waits.input_ttl_s + 1);
     assert_eq!(h.sweep().await.unwrap().len(), 1);

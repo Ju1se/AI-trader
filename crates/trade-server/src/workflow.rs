@@ -40,22 +40,12 @@ const ACTIONS: &str = "executed_actions_readback_verified";
 /// `advance` stops after this many rounds; every round either changes the task or returns.
 const MAX_ROUNDS: usize = 64;
 
-/// A trigger arriving at ADMIT.
-#[derive(Debug, Clone)]
-pub struct Intake {
-    /// Deduplicates triggers: the same key always yields the same task.
-    pub trigger_key: String,
-    pub requester_id: String,
-    pub acting_principal: String,
-    pub trigger_source: String,
-    pub markets: Vec<String>,
-}
-
 /// The identity the task's tools act as, separate from whoever asked.
 const ACTING_PRINCIPAL: &str = "quant_research_svc";
 
 /// A new task as the outside asks for it: the API's request body, the command line, a
-/// test. Missing values take the strategy's defaults.
+/// test. FRAME fills in the strategy's markets and position count; a missing date or
+/// capital stays missing, and FRAME asks the requester for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRequest {
     pub goal: String,
@@ -72,18 +62,6 @@ pub struct TaskRequest {
 
 fn yes() -> bool {
     true
-}
-
-/// What the requester asked for, before FRAME checks it.
-#[derive(Debug, Clone)]
-pub struct FrameRequest {
-    pub goal: String,
-    pub as_of_date: Option<String>,
-    pub markets: Vec<String>,
-    pub portfolio_capital: Option<UsdCents>,
-    pub max_positions: usize,
-    /// May the task finish without placing orders if their approval is refused?
-    pub orders_optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -258,7 +236,6 @@ impl Harness {
 
     // ---- ADMIT and FRAME -------------------------------------------------------------
 
-    /// ADMIT: create the task, or return the one this trigger already created.
     /// ADMIT, then FRAME when the trigger is new. The same trigger always gives the same
     /// task, framed once. Returns the task as it is afterwards, and whether it is new.
     pub async fn start(
@@ -275,41 +252,11 @@ impl Harness {
                 format!("{source}:{}", &sha256_hex(basis.as_bytes())[..16])
             }
         };
-        let (task, created) = self
-            .admit(&self.intake(&trigger_key, requester, source))
-            .await?;
+        let (task, created) = self.admit(&trigger_key, requester, source).await?;
         if created {
-            self.frame(&task.task_id, &self.frame_request(req)).await?;
+            self.frame(&task.task_id, req).await?;
         }
         Ok((self.task(&task.task_id).await?, created))
-    }
-
-    pub fn intake(&self, trigger_key: &str, requester: &str, source: &str) -> Intake {
-        Intake {
-            trigger_key: trigger_key.into(),
-            requester_id: requester.into(),
-            acting_principal: ACTING_PRINCIPAL.into(),
-            trigger_source: source.into(),
-            markets: self.strategy.markets.clone(),
-        }
-    }
-
-    /// The request with the strategy's markets and position count filled in, ready for
-    /// FRAME. A missing date or capital stays missing: FRAME asks the requester for it.
-    pub fn frame_request(&self, r: &TaskRequest) -> FrameRequest {
-        FrameRequest {
-            goal: r.goal.clone(),
-            as_of_date: r.as_of_date.clone(),
-            markets: r
-                .markets
-                .clone()
-                .unwrap_or_else(|| self.strategy.markets.clone()),
-            portfolio_capital: r.portfolio_capital_usd.map(UsdCents::from_dollars),
-            max_positions: r
-                .max_positions
-                .unwrap_or(self.strategy.research.max_positions),
-            orders_optional: r.orders_optional,
-        }
     }
 
     /// A complete rebalance request for `as_of`, with the strategy's capital.
@@ -325,24 +272,31 @@ impl Harness {
         }
     }
 
-    pub async fn admit(&self, intake: &Intake) -> Result<(TaskRecord, bool), GateError> {
-        let id = format!("TASK-{}", &sha256_hex(intake.trigger_key.as_bytes())[..10]);
+    /// ADMIT: create the task, or return the one this trigger already created. The same
+    /// key always gives the same task.
+    pub async fn admit(
+        &self,
+        trigger_key: &str,
+        requester: &str,
+        source: &str,
+    ) -> Result<(TaskRecord, bool), GateError> {
+        let id = format!("TASK-{}", &sha256_hex(trigger_key.as_bytes())[..10]);
         let task = TaskRecord::new_queued(
             TaskId::new(id),
-            &intake.trigger_key,
+            trigger_key,
             &self.task_type.task_type,
             &self.task_type.version,
-            &intake.requester_id,
-            &intake.acting_principal,
-            &intake.trigger_source,
-            intake.markets.clone(),
+            requester,
+            ACTING_PRINCIPAL,
+            source,
+            self.strategy.markets.clone(),
         )?;
-        self.store.create_task(&task, &intake.trigger_source).await
+        self.store.create_task(&task, source).await
     }
 
     /// FRAME: pin the task contract, or ask the requester when the request is ambiguous.
     /// Also takes the answer to an earlier question.
-    pub async fn frame(&self, task_id: &TaskId, req: &FrameRequest) -> Result<Framing, GateError> {
+    pub async fn frame(&self, task_id: &TaskId, req: &TaskRequest) -> Result<Framing, GateError> {
         let mut task = self.task(task_id).await?;
         if !matches!(
             task.state(),
@@ -352,6 +306,10 @@ impl Harness {
         }
         let config = self.config_of(&task).await?;
         let now = self.store.now();
+        let research = &self.strategy.research;
+        let markets = (req.markets.clone()).unwrap_or_else(|| self.strategy.markets.clone());
+        let max_positions = req.max_positions.unwrap_or(research.max_positions);
+        let capital = req.portfolio_capital_usd.map(UsdCents::from_dollars);
         let mut questions = Vec::new();
         let as_of = match req.as_of_date.as_deref().map(str::trim) {
             None | Some("") => {
@@ -362,25 +320,21 @@ impl Harness {
                 .inspect_err(|_| questions.push("invalid_as_of_date"))
                 .ok(),
         };
-        if req.portfolio_capital.is_none_or(|c| c.cents() <= 0) {
+        if capital.is_none_or(|c| c.cents() <= 0) {
             questions.push("missing_or_non_positive_capital");
         }
-        if req.markets.is_empty() {
+        if markets.is_empty() {
             questions.push("empty_universe_markets");
-        } else if req
-            .markets
-            .iter()
-            .any(|m| !task.authorized_markets.contains(m))
-        {
+        } else if markets.iter().any(|m| !task.authorized_markets.contains(m)) {
             questions.push("market_outside_authorized_scope");
         }
-        if req.max_positions == 0 {
+        if max_positions == 0 {
             questions.push("max_positions_must_be_positive");
         }
 
         task.transition(TaskState::Running, now)?;
         let (Some(as_of_date), Some(portfolio_capital), true) =
-            (as_of, req.portfolio_capital, questions.is_empty())
+            (as_of, capital, questions.is_empty())
         else {
             let deadline = now + config.waits.input_ttl_s;
             let wait = WaitMetadata::new(&task.requester_id, deadline, TimeoutAction::HandOff)?;
@@ -395,9 +349,9 @@ impl Harness {
             task_id: task.task_id.clone(),
             goal: req.goal.clone(),
             as_of_date,
-            universe_markets: req.markets.clone(),
+            universe_markets: markets,
             portfolio_capital,
-            max_positions: req.max_positions,
+            max_positions,
             expected_outputs: vec![
                 "quant_ranking".into(),
                 "committee_decisions".into(),
@@ -432,7 +386,6 @@ impl Harness {
                     Some(agent) => self.act_with_model(task, agent).await?,
                     None => self.act(task).await?,
                 },
-                // Out of budget: the owner grants more or has what is done delivered.
                 TaskState::OutcomeUnknown { .. } => {
                     if self.reconcile(task_id).await? {
                         None
@@ -443,6 +396,7 @@ impl Harness {
                         )
                     }
                 }
+                // Anything else waits for a person, a budget decision included.
                 other => Some(Step::Waiting(other.code())),
             };
             if let Some(step) = step {

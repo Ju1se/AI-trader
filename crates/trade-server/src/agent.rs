@@ -448,24 +448,18 @@ impl Harness {
             task.consecutive_denials,
             limits.max_consecutive_denials
         )];
-        let researched = !self.store.evaluations(&task.task_id).await?.is_empty();
+        let plan = self.plan_of(task, contract).await?;
+        let done = self.progress(&task.task_id, &plan).await?;
+        let steps: Vec<String> = plan
+            .steps
+            .iter()
+            .map(|s| format!("{} {}", s.id, plan.status_of(s, &done).as_str()))
+            .collect();
         status.push(format!(
-            "Research: {}.",
-            if researched { "done" } else { "not done yet" }
+            "Plan version {}: {}.",
+            plan.version,
+            steps.join("; ")
         ));
-        if let Some(plan) = self.store.plan(&task.task_id).await? {
-            let done = self.progress(&task.task_id, &plan).await?;
-            let steps: Vec<String> = plan
-                .steps
-                .iter()
-                .map(|s| format!("{} {}", s.id, plan.status_of(s, &done).as_str()))
-                .collect();
-            status.push(format!(
-                "Plan version {}: {}.",
-                plan.version,
-                steps.join("; ")
-            ));
-        }
         match self.store.latest_draft(&task.task_id).await? {
             Some(d) => status.push(format!(
                 "Latest draft {}: {}",

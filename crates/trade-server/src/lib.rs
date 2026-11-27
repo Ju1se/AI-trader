@@ -12,4 +12,4 @@ pub use agent::AgentModel;
 pub use api::{App, Change};
 pub use config::{Strategy, load_task_types};
 pub use tools::{DRAFT_TOOL, ORDER_TOOL};
-pub use workflow::{FrameRequest, Framing, Harness, Intake, PAPER_BROKER_KEY, Step, TaskRequest};
+pub use workflow::{Framing, Harness, PAPER_BROKER_KEY, Step, TaskRequest};

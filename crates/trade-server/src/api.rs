@@ -71,9 +71,6 @@ impl From<GateError> for ApiError {
             GateError::PreDispatch(P::ApprovalNotFound(_)) => {
                 (S::NOT_FOUND, "approval_not_found".into())
             }
-            GateError::PreDispatch(P::ApprovalExpired(_)) => {
-                (S::CONFLICT, "approval_expired".into())
-            }
             GateError::PreDispatch(P::ApprovalNotApproved(_)) => {
                 (S::CONFLICT, "approval_not_pending".into())
             }
@@ -598,6 +595,25 @@ async fn require_task(h: &Harness, id: String) -> ApiResult<TaskId> {
     Ok(id)
 }
 
+/// Check that the task waits in `state` and that `user` is the person it waits for.
+async fn waiting_for(
+    h: &Harness,
+    id: &TaskId,
+    user: &str,
+    state: &str,
+    code: &str,
+) -> ApiResult<()> {
+    let task = h.task(id).await?;
+    if task.state().code() != state {
+        return Err(conflict(code, &format!("the task is not in {state}")));
+    }
+    if task.state().wait_meta().map(|w| w.owner_id.as_str()) != Some(user) {
+        let message = "only the person the task waits for decides";
+        return Err(forbidden("not_allowed", message));
+    }
+    Ok(())
+}
+
 /// Announce the change on the stream and return the task as it is now.
 async fn updated(app: &App, id: &TaskId) -> ApiResult<Json<Value>> {
     app.announce("task.updated", id).await;
@@ -689,7 +705,7 @@ async fn answer(
             "the task has no open question",
         ));
     }
-    let questions = match h.frame(&id, &h.frame_request(&req)).await? {
+    let questions = match h.frame(&id, &req).await? {
         Framing::Ready(_) => vec![],
         Framing::NeedsInput(questions) => questions,
     };
@@ -707,19 +723,7 @@ async fn settle(
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
     let id = TaskId::new(id);
-    let task = h.task(&id).await?;
-    let TaskState::Settling(wait) = task.state() else {
-        return Err(conflict(
-            "not_settling",
-            "the task has no delivery to settle",
-        ));
-    };
-    if user != wait.owner_id {
-        return Err(forbidden(
-            "not_allowed",
-            "only the person the delivery went to settles it",
-        ));
-    }
+    waiting_for(h, &id, &user, "SETTLING", "not_settling").await?;
     match body.decision.as_str() {
         "accept" => {
             h.confirm_settlement(&id, &user, body.review_minutes)
@@ -745,19 +749,7 @@ async fn limit(
 ) -> ApiResult<Json<Value>> {
     let h = app.harness();
     let id = TaskId::new(id);
-    let task = h.task(&id).await?;
-    let TaskState::LimitReached { wait, .. } = task.state() else {
-        return Err(conflict(
-            "not_limit_reached",
-            "the task has not reached a limit",
-        ));
-    };
-    if user != wait.owner_id {
-        return Err(forbidden(
-            "not_allowed",
-            "only the owner the task waits for decides",
-        ));
-    }
+    waiting_for(h, &id, &user, "LIMIT_REACHED", "not_limit_reached").await?;
     match body.decision.as_str() {
         "grant" if body.extra_turns > 0 || body.extra_spend_usd > 0.0 => {
             let spend = UsdCents::from_dollars(body.extra_spend_usd.max(0.0));
@@ -954,7 +946,7 @@ async fn dev_seed(State(app): State<App>) -> ApiResult<Json<Value>> {
     ] {
         let key = format!("demo:{name}");
         let (task, created) = if name == "queued" {
-            h.admit(&h.intake(&key, "alice", "dev_seed")).await?
+            h.admit(&key, "alice", "dev_seed").await?
         } else {
             let mut request = h.rebalance_request("2026-02-10");
             request.trigger_key = Some(key);

@@ -11,15 +11,15 @@
 
 | 路径 | 内容 |
 |---|---|
-| `crates/trade-core` | 类型、ID、任务状态机(图 4a)、风险分级、合约、错误类型。无 IO |
+| `crates/trade-core` | 类型、ID、任务状态机(图 4a)、步骤计划(图 2)、风险分级、合约、错误类型。无 IO |
 | `crates/trade-quant` | 因子打分和否决、时点回测。无 IO |
 | `crates/trade-research` | 三个专家和投资委员会。无 IO |
 | `crates/trade-gate` | 闸门:纯函数 `decide`(图 3a)和执行顺序 `run`。只定义接口,无 IO |
 | `crates/trade-store` | 唯一访问数据库的地方。SQLite 和 PostgreSQL 共用一套 SQL |
 | `crates/trade-adapters` | 外部系统:时点行情(读 `fixtures/`)、模拟券商、OpenAI 兼容的模型接口 |
-| `crates/trade-server` | 用例(图 0)、模型驱动的执行循环、两个受控工具、`/v1` 接口和事件流、命令行 |
-| `config/strategy.toml` | 策略参数:因子权重和阈值、委员会、仓位上限、回测。改了不用重新编译 |
-| `config/task_types/` | 任务类型配置:工具的风险分级、上限、放权级别、等待期限 |
+| `crates/trade-server` | 用例(图 0)、模型驱动的执行循环、受控的读写工具、`/v1` 接口和事件流、命令行 |
+| `config/strategy.toml` | 策略参数:因子权重和阈值、三个专家的打分规则、委员会、仓位上限、回测。改了不用重新编译 |
+| `config/task_types/` | 任务类型配置:工具的风险分级、步骤计划、上限、放权级别、等待期限 |
 | `fixtures/market.json` | 演示和测试用的时点数据 |
 | `prompts/agent.md` | 给模型的说明:可用的工具和规则。改了不用重新编译 |
 | `migrations/` | 数据库结构 |
@@ -70,7 +70,7 @@ cargo run -p trade-server --bin trade -- backtest --root /tmp/yf
 
 ## 失败场景
 
-`notebooks/scenarios.py` 通过接口跑一个成功案例和十个对抗案例:人否决、批准过期、违反规则的要求、资料里的提示注入、请求不完整、券商出错。每个场景按系统状态判定,并统计被拒、人否决、改正的次数和每个完成任务的成本。要在一个刚启动的服务上跑,先固定规则,再接模型,两边比较:
+`notebooks/scenarios.py` 通过接口跑一个成功案例和十二个对抗案例:人否决、批准过期、违反规则的要求、资料里的提示注入、请求不完整、券商出错、运行超时后负责人加额度或没人管。每个场景按系统状态判定,并统计被拒、人否决、改正的次数和每个完成任务的成本。要在一个刚启动的服务上跑,先固定规则,再接模型,两边比较:
 
 ```bash
 cargo run -p trade-server --bin trade -- serve --dev
@@ -96,4 +96,5 @@ TRADE_TEST_PG_URL=postgres://aitrader:aitrader@localhost:5432/postgres cargo tes
 
 - 模型和专家只提议。模型提议的每一次调用都过闸门,读也一样:只能读合约日期、本任务市场范围内的数据(R0、R1),和写一样登记。没写进任务类型配置的工具直接拒绝,R4 永远拒绝,R3 必须由发起人和配置管理员以外的人批准确切内容,批准只能用一次、会过期。
 - 请求发出后出错,任务冻结为 `OUTCOME_UNKNOWN`,先向券商对账再决定;同一个幂等键不会下第二次单。
+- 轮数、花费、时间或连续被拒用完,任务停下等负责人:负责人加了额度才继续,没人管就只交付已完成的部分。发起人不能给自己的任务加额度。
 - 券商凭证只在服务里,不交给专家或模型。

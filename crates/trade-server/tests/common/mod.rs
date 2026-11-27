@@ -5,10 +5,8 @@
 use std::path::PathBuf;
 
 use trade_adapters::{FixtureMarket, PaperBroker};
-use trade_core::{TaskId, TaskTypeConfig, UsdCents};
-use trade_server::{
-    FrameRequest, Harness, Intake, PAPER_BROKER_KEY, Step, Strategy, load_task_types,
-};
+use trade_core::{TaskId, TaskTypeConfig};
+use trade_server::{Harness, PAPER_BROKER_KEY, Step, Strategy, TaskRequest, load_task_types};
 use trade_store::Store;
 
 pub fn root() -> PathBuf {
@@ -48,24 +46,15 @@ pub async fn harness_with(tweak: impl FnOnce(&mut TaskTypeConfig)) -> Harness {
     .await
 }
 
-pub fn intake(trigger_key: &str) -> Intake {
-    Intake {
-        trigger_key: trigger_key.into(),
-        requester_id: "pm_alice".into(),
-        acting_principal: "quant_research_svc".into(),
-        trigger_source: "test".into(),
-        markets: vec!["US".into()],
-    }
-}
-
-pub fn request(as_of: &str, orders_optional: bool) -> FrameRequest {
-    FrameRequest {
+pub fn request(as_of: &str, orders_optional: bool) -> TaskRequest {
+    TaskRequest {
         goal: format!("rebalance for {as_of}"),
         as_of_date: Some(as_of.into()),
-        markets: vec!["US".into()],
-        portfolio_capital: Some(UsdCents::from_dollars(1_000_000.0)),
-        max_positions: 3,
+        markets: Some(vec!["US".into()]),
+        portfolio_capital_usd: Some(1_000_000.0),
+        max_positions: Some(3),
         orders_optional,
+        trigger_key: None,
     }
 }
 
