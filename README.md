@@ -58,6 +58,17 @@ cargo run -p trade-server --bin trade -- agent --model-url http://127.0.0.1:1143
 
 在 Google Colab 上用 GPU 和本地模型跑全程:打开 [`notebooks/colab.ipynb`](notebooks/colab.ipynb)。
 
+## 用真实数据
+
+`notebooks/yfinance_market.py` 从 yfinance 下载一组美股的价格、年报、公司简介和新闻,按「当时已经公开」的规则(年报在财年结束 75 天后才算公开等)写成和 `fixtures/` 同样格式的数据目录。所有命令加上 `--root` 就在这份数据上跑:
+
+```bash
+python3 notebooks/yfinance_market.py --root /tmp/yf
+cargo run -p trade-server --bin trade -- backtest --root /tmp/yf
+```
+
+缺的科目和用到的假设写在 `/tmp/yf/run.json` 里。
+
 ## 用 PostgreSQL
 
 默认用 SQLite。要在 PostgreSQL 上跑,先起本机数据库:
