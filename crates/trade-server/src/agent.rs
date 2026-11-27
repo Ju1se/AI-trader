@@ -1,5 +1,5 @@
 //! ACT driven by a language model (Diagrams 0 and 1). Each round the model proposes one
-//! tool call. Reads run directly; writes go through the gate like any other proposal. The
+//! tool call, and every call, read or write, goes through the gate (Diagram 3a). The
 //! reply and what came of it are appended to the task's session log, and the model sees
 //! them next round. The model never acts itself and never sees a credential.
 //!
@@ -20,7 +20,7 @@ use trade_core::{
 use trade_gate::{GateLedger, GateOutcome, GateRequest, run, used_up_limit};
 use trade_store::CostEntry;
 
-use crate::tools::{DRAFT_TOOL, ORDER_TOOL};
+use crate::tools::{DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadRequest, is_read};
 use crate::workflow::{Harness, Step};
 
 /// Event kinds of the agent's transcript in the session log.
@@ -221,38 +221,8 @@ impl Harness {
             Ok(proposal) => proposal,
             Err(why) => return self.refuse(id, &why).await,
         };
-        let mut task = self.task(id).await?;
         match proposal.tool.as_str() {
-            "research" => {
-                if self.store.evaluations(id).await?.is_empty() {
-                    self.research(&mut task, &contract).await?;
-                }
-                let text = self.research_summary(id).await?;
-                self.observe(id, &text, true).await
-            }
-            "screen" => {
-                let (_, quant) = self.screen(&contract)?;
-                let lines: Vec<String> = quant
-                    .iter()
-                    .map(|q| {
-                        let veto = if q.hard_veto { "vetoed" } else { "kept" };
-                        format!(
-                            "{} score {:+.3} {veto} {:?}",
-                            q.ticker, q.quant_score, q.veto_reasons
-                        )
-                    })
-                    .collect();
-                let text = format!(
-                    "Screen for {}:\n{}",
-                    contract.as_of_date.as_str(),
-                    lines.join("\n")
-                );
-                self.observe(id, &text, true).await
-            }
-            "read_filings" => {
-                let text = self.filings(&task, &contract, &proposal.args).await?;
-                self.observe(id, &text, true).await
-            }
+            "research" | "screen" | "read_filings" => self.read(id, &contract, &proposal).await,
             "create_rebalance_draft" => match weights_arg(&proposal.args) {
                 Err(why) => self.refuse(id, &why).await,
                 Ok(weights) => {
@@ -322,6 +292,70 @@ impl Harness {
                 self.observe(id, &text, false).await
             }
         }
+    }
+
+    /// R0 and R1 (Diagram 3a): a read passes the gate before it happens, like a write.
+    async fn read(
+        &self,
+        id: &TaskId,
+        contract: &TaskContract,
+        proposal: &Proposal,
+    ) -> Result<Option<Step>, GateError> {
+        let tool = proposal.tool.as_str();
+        let name = if tool == "read_filings" {
+            READ_FILINGS
+        } else {
+            READ_MARKET
+        };
+        let ticker = proposal.args.get("ticker").and_then(Value::as_str);
+        let ticker = ticker.filter(|_| name == READ_FILINGS).map(str::to_string);
+        let as_of = contract.as_of_date.as_str();
+        let actions = self.store.actions(id).await?;
+        let n = actions.iter().filter(|a| is_read(&a.tool_name)).count() + 1;
+        let request = GateRequest {
+            task_id: id.clone(),
+            target: format!("{name}:{}", ticker.as_deref().unwrap_or(as_of)),
+            args: ReadRequest {
+                as_of_date: as_of.into(),
+                ticker: ticker.clone(),
+            },
+            idempotency_key: IdempotencyKey::new(format!("read:{id}:{n}")),
+            approval_id: None,
+        };
+        let result = run(&self.store, &self.read_tool(name), &request).await;
+        if !matches!(result, Ok(GateOutcome::Executed { .. })) {
+            self.observe(id, &describe(tool, &result), false).await?;
+            return after_gate(tool, result);
+        }
+        let mut task = self.task(id).await?;
+        let text = match tool {
+            "research" => {
+                if self.store.evaluations(id).await?.is_empty() {
+                    self.research(&mut task, contract).await?;
+                }
+                self.research_summary(id).await?
+            }
+            "screen" => {
+                let (_, quant) = self.screen(contract)?;
+                let lines: Vec<String> = quant
+                    .iter()
+                    .map(|q| {
+                        let veto = if q.hard_veto { "vetoed" } else { "kept" };
+                        format!(
+                            "{} score {:+.3} {veto} {:?}",
+                            q.ticker, q.quant_score, q.veto_reasons
+                        )
+                    })
+                    .collect();
+                format!("Screen for {as_of}:\n{}", lines.join("\n"))
+            }
+            _ => {
+                let ticker = ticker.unwrap_or_default();
+                self.filings(&task, contract, &ticker).await?
+            }
+        };
+        // The gate counted the turn.
+        self.observe(id, &text, false).await
     }
 
     /// Send what a person approved, exactly as approved.
@@ -429,11 +463,8 @@ impl Harness {
         &self,
         task: &TaskRecord,
         contract: &TaskContract,
-        args: &Value,
+        ticker: &str,
     ) -> Result<String, GateError> {
-        let Some(ticker) = args.get("ticker").and_then(Value::as_str) else {
-            return Ok("read_filings: args.ticker is missing.".into());
-        };
         let view = self.market.view(
             task.authorized_markets.clone(),
             self.store.calibrations().await?,
@@ -531,7 +562,9 @@ impl Harness {
             )),
             None => status.push("No draft yet.".into()),
         }
-        for a in self.store.actions(&task.task_id).await? {
+        // Reads are in the transcript; the status lists what was written.
+        let actions = self.store.actions(&task.task_id).await?;
+        for a in actions.iter().filter(|a| !is_read(&a.tool_name)) {
             status.push(format!(
                 "Action {} {}: {}",
                 a.tool_name,

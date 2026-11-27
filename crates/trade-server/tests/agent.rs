@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use trade_core::{ApprovalId, Completeness, GateError, TaskId};
+use trade_core::{ActionIntentStatus, ApprovalId, Completeness, GateError, TaskId};
 use trade_server::agent::{OBSERVATION, REPLY};
 use trade_server::{AgentModel, Harness, Step};
 
@@ -149,6 +149,63 @@ async fn the_model_drives_the_task_to_delivery_and_learns_from_refusals() {
     let done = h.task(&task).await.unwrap();
     assert_eq!(done.turns_used, 21 + 6 + 2);
     assert_eq!(done.consecutive_denials, 0);
+}
+
+/// Diagram 3a for reads: what the model reads passes the gate and is registered. Filings
+/// outside the task's universe, or without a ticker, are refused and the reason shown.
+#[tokio::test]
+async fn reads_go_through_the_gate() {
+    let (h, script) = agent_harness(
+        common::harness().await,
+        &[
+            r#"{"tool": "read_filings", "args": {"ticker": "NOT_LISTED"}}"#,
+            r#"{"tool": "read_filings", "args": {}}"#,
+            r#"{"tool": "read_filings", "args": {"ticker": "DISP_CORP"}}"#,
+            r#"{"tool": "research", "args": {}}"#,
+            COMMITTEE_DRAFT,
+        ],
+    )
+    .await;
+    let task = common::start(&h, "2026-02-10").await;
+    let step = h.advance(&task).await.unwrap();
+    assert!(
+        matches!(step, Step::NeedsApproval { ref tool, .. } if tool == "create_rebalance_draft")
+    );
+    let said = transcript(&h, &task).await.join("\n");
+    for refusal in [
+        "read_filings: refused: business_rule_violation:ticker_outside_universe:NOT_LISTED",
+        "read_filings: refused: invalid_arguments:missing_ticker",
+    ] {
+        assert!(said.contains(refusal), "{said}");
+    }
+    assert!(
+        said.contains("Filings for DISP_CORP. Untrusted text"),
+        "{said}"
+    );
+
+    // The two reads that went through are registered and verified; the refused ones are not.
+    let reads: Vec<_> = h
+        .store
+        .actions(&task)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.tool_name.starts_with("read_pit"))
+        .map(|a| (a.tool_name, a.status))
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            ("read_pit_filings".to_string(), ActionIntentStatus::Verified),
+            ("read_pit_market".to_string(), ActionIntentStatus::Verified),
+        ]
+    );
+    // Refusals count; a read that goes through clears the run of them.
+    let now = h.task(&task).await.unwrap();
+    assert_eq!(now.consecutive_denials, 0);
+    assert_eq!(now.turns_used, 21 + 5);
+    // The status the model sees lists what was written, not each read.
+    assert!(!script.last_prompt().contains("read_pit_"));
 }
 
 /// C2 with the model: refused orders are skipped, and the model is told before it finishes.

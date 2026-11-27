@@ -1,4 +1,5 @@
-//! The two governed write tools: the rebalance draft (R2) and paper orders (R3).
+//! The governed tools: the point-in-time reads the model asks for (R0, R1), the rebalance
+//! draft (R2) and paper orders (R3).
 //!
 //! Business rules are checked against facts the store and the market data hold (the stored
 //! veto list, the contract, the stored draft, the as-of date's market data), never against
@@ -7,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Serialize;
 use trade_adapters::{BrokerOrderReceipt, FixtureMarket, PaperBroker};
 use trade_core::{
     ActionIntentRecord, ExecError, GateError, IdempotencyKey, PitMarketSource, PitSecuritySnapshot,
@@ -19,6 +21,12 @@ use trade_store::{Store, StoredDraft};
 
 pub const DRAFT_TOOL: &str = "create_rebalance_draft";
 pub const ORDER_TOOL: &str = "submit_paper_orders";
+pub const READ_MARKET: &str = "read_pit_market";
+pub const READ_FILINGS: &str = "read_pit_filings";
+
+pub fn is_read(tool: &str) -> bool {
+    tool == READ_MARKET || tool == READ_FILINGS
+}
 
 /// A backstop independent of the strategy settings: no single position above 45%.
 const MAX_POSITION_BPS: u16 = 4_500;
@@ -178,6 +186,84 @@ fn canonical(args: &PortfolioActionPayload) -> Result<String, PreDispatchError> 
 fn payload_of(action: &ActionIntentRecord) -> Result<PortfolioActionPayload, GateError> {
     serde_json::from_str(&action.args_json)
         .map_err(|e| GateError::Storage(format!("corrupt_action_args:{e}")))
+}
+
+/// A read the model asks for. The date comes from the contract, not from the model.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadRequest {
+    pub as_of_date: String,
+    /// The security whose filings to read; `None` reads the market data of the date.
+    pub ticker: Option<String>,
+}
+
+/// R0 and R1: what the model reads passes the same gate as a write (Diagram 3a) and is
+/// registered like one. A read changes nothing, so `execute` only issues a receipt; the
+/// harness reads the point-in-time data once the gate has let the call through.
+pub struct ReadPit {
+    pub name: &'static str,
+    pub store: Store,
+    pub market: FixtureMarket,
+}
+
+impl Tool for ReadPit {
+    type Args = ReadRequest;
+    type Facts = PortfolioFacts;
+
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn min_tier(&self) -> RiskTier {
+        RiskTier::R0
+    }
+
+    fn canonical_args(&self, args: &Self::Args) -> Result<String, PreDispatchError> {
+        if self.name == READ_FILINGS && args.ticker.is_none() {
+            return Err(PreDispatchError::InvalidArguments("missing_ticker".into()));
+        }
+        serde_json::to_string(args).map_err(|e| PreDispatchError::InvalidArguments(e.to_string()))
+    }
+
+    async fn load_facts(
+        &self,
+        task: &TaskRecord,
+        _: &Self::Args,
+    ) -> Result<Self::Facts, GateError> {
+        load_portfolio_facts(&self.store, &self.market, task, None).await
+    }
+
+    /// Only the contract's date, and only securities of the markets the task may see.
+    fn check(
+        &self,
+        args: &Self::Args,
+        _: &TaskRecord,
+        facts: &Self::Facts,
+    ) -> Result<(), PreDispatchError> {
+        use PreDispatchError::BusinessRuleViolation as Rule;
+        if args.as_of_date != facts.contract.as_of_date.as_str() {
+            return Err(Rule("read_outside_contract_date".into()));
+        }
+        match &args.ticker {
+            Some(t) if !facts.universe.iter().any(|s| &s.ticker == t) => {
+                Err(Rule(format!("ticker_outside_universe:{t}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _: &VerifiedGateTicket,
+        _: &TaskId,
+        key: &IdempotencyKey,
+        _: &Self::Args,
+    ) -> Result<String, ExecError> {
+        Ok(key.to_string())
+    }
+
+    async fn readback(&self, _: &Self::Args, _: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// R2: write the rebalance draft. Reversible, so it needs approval only when the task

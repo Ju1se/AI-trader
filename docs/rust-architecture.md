@@ -158,7 +158,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 | 工具 | 怎么执行 |
 |---|---|
-| `research`、`screen`、`read_filings` | 只读,直接执行;公告标为不可信文本 |
+| `research`、`screen`、`read_filings` | 只读,也过闸门(`read_pit_market` R0、`read_pit_filings` R1):只能读合约日期、本任务市场范围内的证券,和写一样登记、回读;公告标为不可信文本 |
 | `create_rebalance_draft`(权重由模型定)、`submit_paper_orders` | 过闸门,和固定规则走的是同一个闸门和同样的批准 |
 | `finish` | 交给验收,验收只看库里的事实 |
 
@@ -185,14 +185,14 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 | 迁移有没有改变行为 | Python 版的基准文件 `crates/trade-server/tests/golden/python-mvp.json` | 每次 `cargo test` 自动比对 |
 | 前端联调 | `/v1/dev` 下的载入演示任务、拨快时钟、券商故障 | 不需要真的 Agent |
 
-测试分四层,共 64 个:
+测试分四层,共 71 个:
 
 | 层 | 测什么 | 怎么测 |
 |---|---|---|
 | core、gate | 迁移表和图 4a 逐条一致;随机事件序列走不到非法状态;闸门九步的顺序和每一道的拒绝;批准的每种失效;读到旧数据时不会覆盖并发的否决 | 属性测试(proptest);表驱动测试;闸门用内存里的账本,不需要异步运行时 |
 | quant、research、adapters | 4 个调仓日的股票池、分数、否决、委员会结论、权重,以及回测指标,都和 Python 版一致;时点规则 | 和基准文件比对,浮点按容差 |
-| store | 版本号冲突、批准只能用一次、没发出去的动作退回批准、结果未知时不能取消、单位成本口径、到期查询、外键 | 每个测试一个新的 SQLite 库;设置 `TRADE_TEST_PG_URL` 后每个测试一个新的 PostgreSQL 库 |
-| server | 用例端到端:两条否决路径、到期处理、两种券商故障、重启后对账、返工、触上限、篡改的引用;HTTP 接口的身份、错误码、去重、事件流、联调接口 | 真实的用例和模拟券商;axum 在进程内调用 |
+| store | 版本号冲突、批准只能用一次、没发出去的动作退回批准、结果未知时不能取消、单位成本口径、到期查询、外键 | 每个测试一个新的 SQLite 库;设置 `TRADE_TEST_PG_URL` 后每个测试一个新的 PostgreSQL 库(在 Colab 的 PostgreSQL 16 上全部通过) |
+| server | 用例端到端:两条否决路径、到期处理、两种券商故障、重启后对账、返工、触上限、篡改的引用;HTTP 接口的身份、错误码、去重、事件流、联调接口;模型驱动的循环:读写都过闸门、被拒后改正、批准后原样发出、触上限 | 真实的用例和模拟券商;axum 在进程内调用;模型是一个按脚本回答的 HTTP 服务 |
 
 ## 7. 每张图落在哪里
 
@@ -208,7 +208,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 | 图 5 场景 | 命令行 `demo`、`research`、`backtest` | `tests/parity.rs` 和 Python 基准逐项比对 |
 | 图 6 收尾与度量 | `Harness::verify`(只读库、行情和券商)、交付、验收、到期结案;store 的单位成本 | `a_tampered_citation_fails_verification_and_goes_to_a_person`、`verification_fails_without_any_evidence`、`spend_limit_sees_every_cost_and_unit_economics_counts_ended_tasks_once` |
 | 图 7 组件 | crate 划分;`server/src/api.rs` 的接口和事件流 | `tests/api.rs` |
-| 图 8 数据模型 | `migrations/0001_schema.sql` | store 的测试;PostgreSQL 上还没跑 |
+| 图 8 数据模型 | `migrations/0001_schema.sql` | store 的测试,SQLite 和 PostgreSQL 16 上都跑过 |
 
 ## 8. 改进清单和完成情况
 
@@ -281,7 +281,6 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 ### 8.8 还没做的
 
-- 在 PostgreSQL 上跑一遍存储层测试(本机当时没有可用的 PostgreSQL)。
 - C3 计划依赖;专家打分规则改成文件;OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
 - 用模型当专家(现在模型只做主 Agent 的提议);由后台任务自动推进 `advance`。
 

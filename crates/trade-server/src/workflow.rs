@@ -24,7 +24,10 @@ use trade_store::{CostEntry, MemoryItem, Store};
 
 use crate::agent::AgentModel;
 use crate::config::Strategy;
-use crate::tools::{CreateDraft, DRAFT_TOOL, ORDER_TOOL, SubmitOrders, limit_breaches};
+use crate::tools::{
+    CreateDraft, DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadPit, SubmitOrders,
+    limit_breaches,
+};
 
 /// The task type this harness runs.
 pub const REBALANCE: &str = "value_committee_rebalance";
@@ -187,6 +190,14 @@ impl Harness {
             store: self.store.clone(),
             market: self.market.clone(),
             committee: self.strategy.committee.clone(),
+        }
+    }
+
+    pub fn read_tool(&self, name: &'static str) -> ReadPit {
+        ReadPit {
+            name,
+            store: self.store.clone(),
+            market: self.market.clone(),
         }
     }
 
@@ -1037,6 +1048,10 @@ impl Harness {
             let result = match action.tool_name.as_str() {
                 DRAFT_TOOL => self.draft_tool().reconcile(action).await?,
                 ORDER_TOOL => self.order_tool().reconcile(action).await?,
+                // A read changed nothing outside; it only has to be marked as read.
+                READ_MARKET | READ_FILINGS => DispatchResult::Verified {
+                    receipt_id: action.idempotency_key.to_string(),
+                },
                 other => DispatchResult::Unknown {
                     receipt_id: None,
                     detail: format!("no_reconciler_for:{other}"),
