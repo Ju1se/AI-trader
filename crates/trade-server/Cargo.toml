@@ -1,0 +1,27 @@
+[package]
+name = "trade-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+futures-util = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+trade-core = { path = "../trade-core" }
+trade-quant = { path = "../trade-quant" }
+trade-research = { path = "../trade-research" }
+trade-gate = { path = "../trade-gate" }
+trade-adapters = { path = "../trade-adapters" }
+trade-store = { path = "../trade-store" }
+
+[dev-dependencies]
+tower = { workspace = true }
+
+[[bin]]
+name = "trade"
+path = "src/main.rs"

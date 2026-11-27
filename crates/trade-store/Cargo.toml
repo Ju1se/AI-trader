@@ -1,0 +1,17 @@
+[package]
+name = "trade-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The only crate that uses sqlx. It knows the core types and the gate's ledger interface,
+# nothing about research, quant or market data.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+trade-core = { path = "../trade-core" }
+trade-gate = { path = "../trade-gate" }
+
+[dev-dependencies]
+tokio = { workspace = true }

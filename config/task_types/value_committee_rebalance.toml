@@ -1,0 +1,43 @@
+# Task type profile (Diagram 8 TASK_TYPE_PROFILE, D2). It is stored in the database at
+# start-up. A version never changes once stored: to change a rule, edit it here and bump
+# `version`. Tasks keep the version they started with.
+
+task_type = "value_committee_rebalance"
+version = "3.0.0"
+shape_level = "MultiAgent"
+shape_rationale = "A deterministic factor screen ranks the whole point-in-time universe; read-only specialists and an investment committee review the candidates."
+autonomy_level = "PerActionApproval"
+config_admin_id = "platform_admin"
+done_criteria = [
+    "citations_pit_valid",
+    "no_vetoed_holdings",
+    "portfolio_constraints_valid",
+    "executed_actions_readback_verified",
+]
+
+# Diagram 3a: reads are R0 and R1, the draft is R2, orders are R3. Moving money is R4 and is
+# never allowed. A tool missing from this table is refused.
+[allowed_tools]
+read_pit_market = "R0"
+read_pit_filings = "R1"
+create_rebalance_draft = "R2"
+submit_paper_orders = "R3"
+direct_wire_transfer = "R4"
+
+[budget_limits]
+max_turns = 50
+max_spend = 500           # cents
+reserved_close_spend = 25 # cents kept back for verifying and delivering
+max_wall_ms = 120_000     # working time since the task last started running
+max_retries = 3
+max_consecutive_denials = 6
+max_reworks = 2
+
+[waits]
+input_ttl_s = 172_800     # 48 h for the requester to clarify, then a person takes over
+approval_ttl_s = 86_400   # 24 h for an approver, then it counts as rejected
+settle_window_s = 259_200 # 72 h to dispute a delivery, then it completes
+handoff_ack_ttl_s = 14_400 # 4 h for the new owner to take over, then the next owner
+approver_role = "portfolio_approver"
+escalation_owner_id = "risk_committee_lead"
+backup_owner_id = "operations_on_call"

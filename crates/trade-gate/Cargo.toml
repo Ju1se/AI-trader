@@ -1,0 +1,9 @@
+[package]
+name = "trade-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Architectural Requirement #2: `trade-gate` ONLY depends on `trade-core`!
+[dependencies]
+trade-core = { path = "../trade-core" }

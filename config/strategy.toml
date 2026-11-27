@@ -1,0 +1,66 @@
+# Strategy parameters (Rust plan §6, D1). Edit and run again; nothing is recompiled.
+# Every value here is also the built-in default, so a missing line falls back to it.
+# Unknown keys are rejected, so a typo cannot be silently ignored.
+
+markets = ["US"]
+rebalance_dates = ["2024-06-30", "2025-06-30", "2026-02-10", "2026-05-01"]
+
+[research]
+# The specialists examine this many of the best securities the quant screen kept,
+max_candidates = 8
+# plus these, even when vetoed, to audit the veto.
+audit_tickers = ["TRAP_CO"]
+max_positions = 3
+portfolio_capital = 100_000_000 # cents, i.e. $1,000,000
+worker_cost = 3                 # cents booked per security the specialists examine
+
+[factors]
+min_adv_usd = 1_000_000.0
+momentum_tiebreak = 0.05
+
+[factors.weights]
+valuation = 0.30
+quality = 0.20
+financial_health = 0.15
+earnings_quality = 0.10
+cash_flow = 0.10
+growth = 0.10
+capital_allocation = 0.05
+
+[factors.penalty]
+altman_z_below = 2.99
+interest_cov_below = 4.0
+beneish_m_above = -2.20
+accruals_above = 0.05
+distress_weight = 0.15
+manipulation_weight = 0.15
+illiquidity_weight = 0.10
+
+[factors.veto]
+altman_z_below = 1.8
+interest_cov_below = 1.5
+beneish_m_above = -1.78
+accruals_quantile = 0.80
+
+[committee]
+dispersion_threshold = 0.45
+escalation_consensus_floor = -0.10
+max_single_weight = 3500   # bps
+max_industry_weight = 6500 # bps
+max_adv_participation = 0.10
+
+[committee.weights]
+quant = 0.45
+moat = 0.20
+management_capalloc = 0.15
+footnote_forensics = 0.20
+
+# The backtest uses the markets and factor settings above.
+[backtest]
+top_n = 3
+portfolio_capital = 100_000_000 # cents
+one_way_cost = 15               # bps
+max_adv_participation = 0.10
+max_single_weight = 0.40
+buffer_band_pct = 0.20
+oos_start_date = "2026-02-10"

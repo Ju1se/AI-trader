@@ -1,0 +1,23 @@
+# 本机开发用的 PostgreSQL。默认用 SQLite 时不需要它。
+# 启动:docker compose up -d db
+# 服务:trade serve --db postgres://aitrader:aitrader@localhost:5432/aitrader
+# 存储层测试:TRADE_TEST_PG_URL=postgres://aitrader:aitrader@localhost:5432/postgres cargo test -p trade-store
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aitrader
+      POSTGRES_PASSWORD: aitrader # 只用于本机开发,上云时换成托管数据库的凭证
+      POSTGRES_DB: aitrader
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aitrader -d aitrader"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata: {}
