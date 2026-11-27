@@ -34,14 +34,14 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | HTTP | `code` | 什么时候出现 |
 |---|---|---|
 | 401 | `missing_identity` | 没带 `X-User-Id` |
-| 403 | `self_approval_forbidden` | 发起人或配置管理员想批准 |
+| 403 | `self_approval_forbidden` | 发起人或配置管理员想批准;发起人想给自己的任务加额度 |
 | 403 | `not_requester` | 不是发起人却去回答问题 |
-| 403 | `not_allowed` | 不是发起人却去验收、取消、重开;不是接手人却去交回 |
+| 403 | `not_allowed` | 不是发起人却去验收、取消、重开;不是接手人却去交回;不是任务等的负责人却去处理触上限 |
 | 404 | `task_not_found` `approval_not_found` `contract_not_found` | 对象不存在 |
 | 409 | `invalid_transition` | 当前状态不允许这个操作 |
 | 409 | `state_conflict` | 任务被别人同时改了,重新取详情后再试 |
 | 409 | `unresolved_actions` | 还有已发出但结果未定的动作,不能取消或判失败 |
-| 409 | `not_awaiting_input` `not_settling` | 任务不在对应的等待状态 |
+| 409 | `not_awaiting_input` `not_settling` `not_limit_reached` | 任务不在对应的等待状态 |
 | 409 | `approval_not_pending` | 这条批准已经处理过 |
 | 409 | `approval_expired` | 批准已过期,按否决处理,任务同时变化(见「批准」) |
 | 422 | `invalid_request` | 请求体不合法,或字段取值不认识 |
@@ -60,7 +60,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | `AWAITING_INPUT` | 等回答 | requester | 发起人回答 |
 | `AWAITING_APPROVAL` | 等批准 | approver | 批准人批准或否决 |
 | `OUTCOME_UNKNOWN` | 结果未知 | reconciler | 推进(会先对账)。不能取消 |
-| `LIMIT_REACHED` | 触上限 | owner | 推进(验收已完成的部分) |
+| `LIMIT_REACHED` | 触上限 | owner | 负责人加额度,或交付已完成的部分 |
 | `VERIFYING` | 验收中 | verifier | 只读 |
 | `SETTLING` | 待确认 | requester | 发起人验收或退回 |
 | `COMPLETED` | 已完成 | none | 发起人重开 |
@@ -88,6 +88,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | `POST /v1/tasks/{id}/cancel` | 取消 | 发起人 |
 | `POST /v1/tasks/{id}/reopen` | 重开已完成的任务 | 发起人 |
 | `POST /v1/tasks/{id}/hand-back` | 转人工后交回 Agent | 接手人 |
+| `POST /v1/tasks/{id}/limit` | 触上限后加额度,或交付已完成的部分 | 任务等的负责人(`wait.owner`) |
 | `GET /v1/approvals` | 批准收件箱,可按 `status` 过滤 | 已识别的用户 |
 | `GET /v1/approvals/{id}` | 批准详情:确切内容和规则 | 已识别的用户 |
 | `POST /v1/approvals/{id}/decision` | 批准或否决 | 发起人和配置管理员以外的人 |
@@ -135,7 +136,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 {
   "id": "TASK-40f4d4b068",
   "task_type": "value_committee_rebalance",
-  "config_version": "3.2.0",
+  "config_version": "3.3.0",
   "state": "AWAITING_APPROVAL",
   "state_label": "等批准",
   "owner_role": "approver",
@@ -145,14 +146,14 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
   "acting_principal": "quant_research_svc",
   "markets": ["US"],
   "wait": {"owner": "portfolio_approver", "deadline": "2026-11-28T09:07:10Z", "on_timeout": "DECLINE"},
-  "usage": {"turns": 22, "spend_usd": 0.21, "retries": 0, "consecutive_denials": 0, "reworks": 0, "reopened": 0},
+  "usage": {"turns": 22, "spend_usd": 0.21, "retries": 0, "consecutive_denials": 0, "reworks": 0, "reopened": 0, "granted_turns": 0, "granted_spend_usd": 0.0},
   "allowed_next_states": ["RUNNING", "HANDED_OFF", "DECLINED", "CANCELLED"]
 }
 ```
 
-- `wait` 只在等待状态出现:等谁(`owner`)、到什么时候(`deadline`)、到期怎么办(`on_timeout`)。到期动作有四种:`HAND_OFF`(转人工)、`DECLINE`(按否决处理)、`COMPLETE`(按验收通过结案)、`ESCALATE`(交给下一个负责人)。到期永远不会当成批准。
+- `wait` 只在等待状态出现:等谁(`owner`)、到什么时候(`deadline`)、到期怎么办(`on_timeout`)。到期动作有五种:`HAND_OFF`(转人工)、`DECLINE`(按否决处理)、`COMPLETE`(按验收通过结案)、`ESCALATE`(交给下一个负责人)、`DELIVER`(验收并交付已完成的部分)。到期永远不会当成批准。
 - `state_detail` 是 `LIMIT_REACHED`、`FAILED`、`DECLINED`、`CANCELLED` 的原因,或 `OUTCOME_UNKNOWN` 冻结的动作的幂等键。
-- `usage` 对应任务类型配置里的上限。
+- `usage` 对应任务类型配置里的上限。`granted_turns` 和 `granted_spend_usd` 是负责人另加的额度,只对这个任务有效,加在配置的上限之上。
 
 `GET /v1/tasks/{id}` 另外带:
 
@@ -177,17 +178,19 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | `step.kind` | 意思 | 前端接着做什么 |
 |---|---|---|
 | `needs_approval` | 一个动作等人批准,带 `approval_id` 和 `tool` | 去批准收件箱 |
-| `denied` | 闸门拒绝了这个动作,`reason` 是原因,例如 `business_rule_violation:vetoed_ticker_in_portfolio:TRAP_CO` | 展示原因。连续被拒到上限后任务会停下 |
+| `denied` | 闸门拒绝了这个动作,`reason` 是原因,例如 `business_rule_violation:vetoed_ticker_in_portfolio:TRAP_CO` | 展示原因。连续被拒到上限后任务停在 `LIMIT_REACHED` 等负责人 |
 | `delivered` | 已验收并交付,任务进入 `SETTLING`,带 `completeness` 和 `gaps` | 请发起人验收 |
 | `handed_off` | 转人工了,`owner` 是接手人 | 展示交接包 |
-| `waiting` | 任务在等人或已结束,`state` 是当前状态 | 无 |
+| `waiting` | 任务在等人或已结束,`state` 是当前状态。`LIMIT_REACHED` 表示用完了轮数、花费、时间或连续被拒的上限 | `LIMIT_REACHED` 时请 `wait.owner` 处理(见下节),其余无 |
 
 验收只看库里的事实:专家引用的记录在调仓日之前已公开,草稿里没有被否决的股票,权重满足总量、单只、行业和流动性上限,每个动作都已核对并且券商那边还能读到一样的单。没通过会自动返工,返工次数用完就转人工。
 
-## 回答、验收、取消、重开、交回
+## 回答、验收、取消、重开、交回、触上限
 
 | 接口 | 请求体 | 成功后 |
 |---|---|---|
+| `POST /v1/tasks/{id}/limit` | `{"decision": "grant", "extra_turns": 10, "extra_spend_usd": 1.0, "reason": "做完下单"}` | `RUNNING`。额度只加在这个任务上,连续被拒次数清零,时间从现在重新算。至少要加轮数或花费中的一项。返工或重试次数用完的任务(`state_detail` 是 `max_reworks`、`max_retries`)不能加额度,返回 409 `invalid_transition`,只能交付 |
+| `POST /v1/tasks/{id}/limit` | `{"decision": "deliver"}` | 验收并交付已完成的部分:`SETTLING`,交付清单为 `PARTIAL`,缺口里有 `stopped_by_limit:*`。什么都没做成时转人工 |
 | `POST /v1/tasks/{id}/answer` | 和创建任务一样的字段,补全缺的那项 | `RUNNING`,或者还缺东西时仍是 `AWAITING_INPUT`。返回 `{open_questions, task}` |
 | `POST /v1/tasks/{id}/settle` | `{"decision": "accept", "review_minutes": 3}` | `COMPLETED`。`review_minutes` 计入人工成本 |
 | `POST /v1/tasks/{id}/settle` | `{"decision": "return", "comment": "补上缺口"}` | `RUNNING`,算一次返工 |
@@ -195,7 +198,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 | `POST /v1/tasks/{id}/reopen` | `{"reason": "发现公司行动遗漏"}` | `RUNNING`,算一次返工 |
 | `POST /v1/tasks/{id}/hand-back` | 无 | `RUNNING` |
 
-都返回更新后的任务详情(`answer` 除外,见上)。发起人在验收窗口内既不验收也不退回,窗口结束时按验收通过结案。
+都返回更新后的任务详情(`answer` 除外,见上)。发起人在验收窗口内既不验收也不退回,窗口结束时按验收通过结案。触上限的任务只有 `wait.owner`(任务类型配置的 `escalation_owner_id`)能处理,发起人不能给自己的任务加额度;负责人在 `limit_ttl_s`(默认 4 小时)内不处理,到期按 `deliver` 处理。
 
 ## 批准
 
@@ -326,7 +329,6 @@ curl -s -H "X-User-Id: alice" $B/v1/metrics/scorecard
 
 - 真实登录和角色。现在 `X-User-Id` 写什么就是谁;批准只校验不是发起人和配置管理员,不校验批准人角色。
 - 机器可读的接口定义(OpenAPI)。原来的 `openapi.json` 是 Python 版生成的,已删除。
-- 加额度(`LIMIT_REACHED` 之后继续做)的接口。现在只能验收已完成的部分。
 - 任务类型配置的增删改。现在从 `config/task_types/` 读,改了要重启并升版本号。
 - 事件流的身份校验和断线续传。
 - 用模型当专家。现在模型只做主 Agent 的提议,三个专家还是确定性的规则。

@@ -3,7 +3,7 @@
 # `version`. Tasks keep the version they started with.
 
 task_type = "value_committee_rebalance"
-version = "3.2.0"
+version = "3.3.0"
 shape_level = "MultiAgent"
 shape_rationale = "A deterministic factor screen ranks the whole point-in-time universe; read-only specialists and an investment committee review the candidates."
 autonomy_level = "PerActionApproval"
@@ -39,6 +39,7 @@ input_ttl_s = 172_800     # 48 h for the requester to clarify, then a person tak
 approval_ttl_s = 86_400   # 24 h for an approver, then it counts as rejected
 settle_window_s = 259_200 # 72 h to dispute a delivery, then it completes
 handoff_ack_ttl_s = 14_400 # 4 h for the new owner to take over, then the next owner
+limit_ttl_s = 14_400       # 4 h for the owner to grant more budget, then what is done is delivered
 approver_role = "portfolio_approver"
 escalation_owner_id = "risk_committee_lead"
 backup_owner_id = "operations_on_call"

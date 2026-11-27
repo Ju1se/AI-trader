@@ -598,3 +598,47 @@ async fn a_lost_broker_reply_is_reconciled_through_the_api() {
     assert_eq!(orders.len(), 1);
     assert_eq!(orders[0]["status"], "VERIFIED");
 }
+
+/// Diagram 4a over the API: a task out of working time waits for its owner. Only that owner
+/// decides; a grant runs it on. A task nobody decides on is delivered at the deadline.
+#[tokio::test]
+async fn a_task_out_of_budget_waits_for_its_owner() {
+    let (_, router) = app(true).await;
+    let clock = |s: i64| json!({"advance_s": s});
+    let id = create(&router, Some("2026-02-10")).await;
+    call(&router, "POST", "/v1/dev/clock", None, Some(clock(1_801))).await;
+    let step = advance(&router, &id).await;
+    assert_eq!(
+        step["step"],
+        json!({"kind": "waiting", "state": "LIMIT_REACHED"})
+    );
+    assert_eq!(step["task"]["wait"]["on_timeout"], "DELIVER");
+
+    let path = format!("/v1/tasks/{id}/limit");
+    let grant = json!({"decision": "grant", "extra_turns": 5, "reason": "more time"});
+    let (status, body) = call(&router, "POST", &path, Some("alice"), Some(grant.clone())).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("not_allowed"))
+    );
+    let owner = Some("risk_committee_lead");
+    let (status, task) = call(&router, "POST", &path, owner, Some(grant)).await;
+    assert_eq!((status, state(&task)), (StatusCode::OK, "RUNNING"));
+    assert_eq!(task["usage"]["granted_turns"], 5);
+    assert_eq!(
+        advance(&router, &id).await["step"]["kind"],
+        "needs_approval"
+    );
+
+    // Nobody decides on this one: at the deadline what is done is delivered. Nothing was
+    // drafted, so a person takes it over.
+    let other = create(&router, Some("2026-05-01")).await;
+    call(&router, "POST", "/v1/dev/clock", None, Some(clock(1_801))).await;
+    assert_eq!(
+        advance(&router, &other).await["step"]["state"],
+        "LIMIT_REACHED"
+    );
+    call(&router, "POST", "/v1/dev/clock", None, Some(clock(14_401))).await;
+    let (_, task) = call(&router, "GET", &format!("/v1/tasks/{other}"), owner, None).await;
+    assert_eq!(state(&task), "HANDED_OFF");
+}

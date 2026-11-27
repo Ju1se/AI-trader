@@ -328,12 +328,18 @@ async fn the_turn_limit_stops_a_model_that_never_finishes() {
     )
     .await;
     let task = common::start(&h, "2026-02-10").await;
-    let step = h.advance(&task).await.unwrap();
-    // Nothing was drafted, so verification of what was finished fails and a person takes over.
-    assert!(matches!(step, Step::HandedOff(_)), "{step:?}");
+    // Out of turns, the task waits for its owner (Diagram 4a).
+    assert_eq!(
+        h.advance(&task).await.unwrap(),
+        Step::Waiting("LIMIT_REACHED")
+    );
     assert_eq!(script.calls(), 5);
     let events = h.store.events(&task).await.unwrap();
     assert!(events.iter().any(|e| e.detail == "limit_reached:max_turns"));
+    // The owner has what is done delivered. Nothing was drafted, so verification fails and
+    // a person takes over.
+    let step = h.deliver_what_is_done(&task).await.unwrap();
+    assert!(matches!(step, Step::HandedOff(_)), "{step:?}");
 }
 
 /// No model, no progress: the task is left as it was and the error says why.

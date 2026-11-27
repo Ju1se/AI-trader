@@ -1,5 +1,5 @@
-"""Failure scenarios for the agent: one success case and ten adversarial cases, run through
-the HTTP API of `trade serve --dev` on the demo data.
+"""Failure scenarios for the agent: one success case and twelve adversarial cases, run
+through the HTTP API of `trade serve --dev` on the demo data.
 
     python3 notebooks/scenarios.py --base http://127.0.0.1:8000
 
@@ -36,9 +36,9 @@ PARTIAL = {"state": "COMPLETED", "completeness": "PARTIAL", "orders": 0}
 DECLINED = {"state": "DECLINED", "orders": 0}
 
 
-def case(name, source, expect, decisions=(), fault=None, **request):
+def case(name, source, expect, decisions=(), fault=None, limit=None, **request):
     return {"name": name, "source": source, "expect": expect, "decisions": list(decisions),
-            "fault": fault, "request": request}
+            "fault": fault, "limit": limit, "request": request}
 
 
 CASES = [
@@ -58,6 +58,10 @@ CASES = [
          {**DONE, "asked": "missing_as_of_date"}, as_of_date=None),
     case("券商丢了回执", "导图4 RECOVER;图4b", DONE, fault="timeout_after_fill"),
     case("券商没收到单", "导图4 RECOVER;图4b", DONE, fault="drop_before_fill"),
+    # After the orders are approved the working time runs out; the owner decides.
+    case("运行超时,负责人加额度", "导图7 ADMIT 上限;图4a 触上限→运行中", DONE, limit="grant"),
+    case("运行超时,没人管", "图4a 触上限→验收中,到期交付", {**PARTIAL, "gap": "stopped_by_limit:max_wall_clock"},
+         limit="lapse"),
 ]
 
 
@@ -74,7 +78,7 @@ def client(base):
     return call
 
 
-def run(call, c, approval_ttl_s):
+def run(call, c, rules):
     started = time.time()
     request = {"goal": GOAL, "as_of_date": AS_OF, "portfolio_capital_usd": 1_000_000,
                "trigger_key": f"scenario-{time.time_ns()}", **c["request"]}
@@ -90,6 +94,14 @@ def run(call, c, approval_ttl_s):
         step = call("POST", f"/v1/tasks/{tid}/advance", "ops")["step"]
         if step["kind"] == "waiting" and step["state"] == "OUTCOME_UNKNOWN":
             continue  # the next advance reconciles with the broker
+        if step["kind"] == "waiting" and step["state"] == "LIMIT_REACHED":
+            if c["limit"] != "grant":  # nobody decides: at the deadline what is done is delivered
+                call("POST", "/v1/dev/clock", body={"advance_s": rules["limit_ttl_s"] + 1})
+                break
+            owner = call("GET", f"/v1/tasks/{tid}", "alice")["wait"]["owner"]
+            call("POST", f"/v1/tasks/{tid}/limit", owner,
+                 {"decision": "grant", "extra_turns": 10, "extra_spend_usd": 1.0, "reason": "scenario"})
+            continue
         if step["kind"] != "needs_approval":
             break
         weights = call("GET", f"/v1/approvals/{step['approval_id']}", "bob")["payload"]["weights_bps"]
@@ -98,12 +110,14 @@ def run(call, c, approval_ttl_s):
         if never in weights:  # the approver reads the exact payload
             decision = "reject"
         if decision == "expire":
-            call("POST", "/v1/dev/clock", body={"advance_s": approval_ttl_s + 1})
+            call("POST", "/v1/dev/clock", body={"advance_s": rules["approval_ttl_s"] + 1})
         else:
             if c["fault"] and step["tool"] == "submit_paper_orders":
                 call("POST", "/v1/dev/broker-fault", body={"fault": c["fault"]})
             call("POST", f"/v1/approvals/{step['approval_id']}/decision", "bob",
                  {"decision": decision, "reason": "scenario"})
+            if c["limit"] and step["tool"] == "submit_paper_orders":
+                call("POST", "/v1/dev/clock", body={"advance_s": rules["max_wall_s"] + 1})
         overrides += decision != "approve"
     task = call("GET", f"/v1/tasks/{tid}", "alice")
     if task["state"] == "SETTLING":
@@ -136,6 +150,8 @@ def run(call, c, approval_ttl_s):
         problems.append(f"单只占 {max(weights.values())} 基点")
     if "asked" in c["expect"] and c["expect"]["asked"] not in asked:
         problems.append("没有先问发起人")
+    if "gap" in c["expect"] and c["expect"]["gap"] not in delivery.get("gaps", []):
+        problems.append(f"缺口里没有 {c['expect']['gap']}")
     usage = task.get("usage") or {}
     return {"name": c["name"], "source": c["source"], "problems": problems, "actual": actual,
             "errors": errors, "overrides": overrides, "corrections": corrections, "replies": replies,
@@ -150,14 +166,19 @@ def main():
     args = parser.parse_args()
     call = client(args.base.rstrip("/"))
     model = call("GET", "/health")["model"]
-    approval_ttl_s = call("GET", "/v1/task-types")[0]["waits"]["approval_ttl_s"]
+    task_type = call("GET", "/v1/task-types")[0]
+    rules = {
+        "approval_ttl_s": task_type["waits"]["approval_ttl_s"],
+        "limit_ttl_s": task_type["waits"]["limit_ttl_s"],
+        "max_wall_s": task_type["budget_limits"]["max_wall_ms"] // 1000,
+    }
     print(f"形态:{'模型 ' + model if model else '固定规则,不接模型'}\n")
 
     results = []
     for c in CASES:
         if args.only and c["name"] not in args.only.split(","):
             continue
-        r = run(call, c, approval_ttl_s)
+        r = run(call, c, rules)
         results.append(r)
         print(f"{'通过' if not r['problems'] else '未通过'}  {r['name']}({r['source']})")
         print(f"      {r['actual']};被拒 {r['errors']},人否决或过期 {r['overrides']},改正 {r['corrections']},"

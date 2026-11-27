@@ -1,6 +1,6 @@
 # 数据库设计
 
-先用轻量的 SQLite 开发,上云时换成 PostgreSQL 只改连接串。结构在 [`migrations/0001_schema.sql`](../migrations/0001_schema.sql),访问数据库的代码只在 `crates/trade-store`。表之间的关系对应 [`diagrams.md`](diagrams.md) 的图 8。
+先用轻量的 SQLite 开发,上云时换成 PostgreSQL 只改连接串。结构在 `migrations/` 下的三个脚本里:[`0001_schema.sql`](../migrations/0001_schema.sql) 建表,[`0002_plans.sql`](../migrations/0002_plans.sql) 加计划表,[`0003_budget_grants.sql`](../migrations/0003_budget_grants.sql) 给任务加两列额度。访问数据库的代码只在 `crates/trade-store`。表之间的关系对应 [`diagrams.md`](diagrams.md) 的图 8。
 
 ## 可移植规则
 
@@ -11,7 +11,7 @@
 3. **一个连接池服务两种数据库**:sqlx 的 `AnyPool`,按连接串选驱动。行用 `#[derive(FromRow)]` 映射成结构体,不逐列手写读取。
 4. **外键两边都检查**:sqlx 打开 SQLite 连接时默认开启外键检查,本地测试就能发现插入顺序这类问题。
 5. **并发靠版本号**:任务每次更新都带「版本号没变才更新」的条件,两种数据库都支持,不依赖数据库特有的锁语法。
-6. **结构只通过迁移脚本改**:启动时自动执行 `migrations/` 下还没执行过的脚本。已经用过的脚本不能再改(sqlx 会校验内容),改结构就加一个新的 `0002_...sql`。
+6. **结构只通过迁移脚本改**:启动时自动执行 `migrations/` 下还没执行过的脚本。已经用过的脚本不能再改(sqlx 会校验内容),改结构就加一个新脚本,编号接着往下排(现在到 `0003`)。
 
 行情数据不放在这个库里。演示和测试用 `fixtures/market.json`,由行情适配器按「当天之前已公开」的规则读出;以后接真实行情源时换适配器,库不用动。
 
@@ -20,7 +20,8 @@
 | 表 | 图 8 的实体 | 存什么 | 关键约束 |
 |---|---|---|---|
 | `task_types` | TASK_TYPE_PROFILE | 任务类型配置(JSON):工具的风险分级、上限、放权级别、等待期限 | 主键 `(task_type, version)`。同一版本的内容不能变 |
-| `tasks` | TASK、AUTHORITY、WAIT | 任务和当前状态;执行身份和授权市场;当前等待的人、期限和到期动作;各项上限的用量 | `idempotency_trigger_key` 唯一;`version` 用于条件更新;外键指向 `task_types` |
+| `tasks` | TASK、AUTHORITY、WAIT | 任务和当前状态;执行身份和授权市场;当前等待的人、期限和到期动作;各项上限的用量;触上限后负责人另加的轮数和花费(`granted_turns`、`granted_spend_cents`) | `idempotency_trigger_key` 唯一;`version` 用于条件更新;外键指向 `task_types` |
+| `plans` | PLAN | 任务计划的每一个版本(JSON)和改版的原因,例如有人否决了可以跳过的一步 | 主键 `(task_id, version)`,最新的版本是现行的 |
 | `task_events` | SESSION_EVENT、AUDIT_RECORD | 时间线和审计记录,只追加:每次状态变化、拒绝、批准决定、动作、成本,以及模型的对话记录(`agent.reply`、`agent.observation`) | 主键 `(task_id, seq)`,每个任务从 1 连续编号 |
 | `contracts` | TASK_CONTRACT | 任务合约(JSON) | 每个任务一行 |
 | `actions` | ACTION | 动作:工具、对象、参数、参数哈希、状态、外部回执 | 主键 `idempotency_key` |
@@ -33,8 +34,6 @@
 | `agent_calibration` | (学习) | 每个专家的可信度 | 主键 `agent_name` |
 | `curated_memory` | (学习) | 结案后整理的经验,等人审核 | 主键 `memory_id` |
 
-图 8 里的 PLAN 在 `plans` 表(`migrations/0002_plans.sql`):任务计划的每一个版本都留着,最新的是现行的。
-
 ## 几个关键设计
 
 - **去重**:`tasks.idempotency_trigger_key` 唯一。同一个触发事件到达两次,第二次插入撞上唯一约束,返回已有任务。
@@ -43,7 +42,7 @@
 - **一个决定一个事务**:
   - 请求批准:插入批准记录,同时任务进入 `AWAITING_APPROVAL`。
   - 发出动作:批准从 `APPROVED` 改为 `CONSUMED`(条件:任务、参数哈希都对得上,且没过期)、动作登记为 `DISPATCHED`、任务按版本号更新,三件事同一个事务,任何一件失败都不生效。
-  - 批准决定:批准状态和任务的下一个状态一起写。
+  - 批准决定:批准状态、任务的下一个状态,以及跳过被否决的那一步之后的新计划,一起写。
   - 交付、转人工、对账:各自的记录和任务状态一起写。
 - **批准**:只对一个参数哈希有效,只能用一次,会过期。批准后、用掉之前还可以撤回。一个动作被证实没发出去时,它用过的批准恢复为 `APPROVED`,重发不需要再批一次。
 - **结果未知**:动作发出后出错,动作记为 `UNKNOWN`、任务进入 `OUTCOME_UNKNOWN`。只要还有已发出但没定论的动作,同一个任务的其他动作都会被闸门拦下,任务也不能取消或判失败。
@@ -58,4 +57,4 @@
 3. 连接池上限现在是 5,按实例数和数据库的连接上限调整。
 4. 现在假设只有一个服务进程:启动时对账的逻辑会把所有「已发出」的动作当作上次进程留下的。要跑多个实例,先给对账加上按实例的租约。
 
-PostgreSQL 上的测试还没有跑过:开发这一版时本机没有可用的 PostgreSQL。SQL 只用了两边都支持的写法,但在真正跑过之前不能算验证过。
+存储层的测试和一次完整的任务在 Colab 的 PostgreSQL 16 上跑通过(笔记本第 8 节),当时只有 `0001`;`0002` 和 `0003` 还要在 PostgreSQL 上再跑一次。

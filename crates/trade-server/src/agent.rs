@@ -14,8 +14,7 @@ use serde_json::Value;
 use trade_adapters::{ChatMessage, ChatModel};
 use trade_core::{
     CostEntry, GateError, IdempotencyKey, PortfolioActionPayload, PreDispatchError,
-    ReadOnlyPitView, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, UsdCents,
-    WeightBps,
+    ReadOnlyPitView, TaskContract, TaskId, TaskRecord, TaskTypeConfig, UsdCents, WeightBps,
 };
 use trade_gate::{GateLedger, GateOutcome, GateRequest, run, used_up_limit};
 
@@ -127,6 +126,9 @@ fn describe(tool: &str, result: &Result<GateOutcome, GateError>) -> String {
         Ok(GateOutcome::NeedsApproval { approval_id, .. }) => format!(
             "{tool}: waiting for a person's approval ({approval_id}). You will be told the decision."
         ),
+        Err(GateError::PreDispatch(PreDispatchError::LimitReached(limit))) => format!(
+            "{tool}: not sent: the task reached its limit ({limit}) and waits for its owner."
+        ),
         Err(GateError::PreDispatch(e)) => format!(
             "{tool}: refused: {}. Change the proposal; do not repeat it unchanged.",
             e.code()
@@ -163,12 +165,7 @@ impl Harness {
         let config = self.config_of(&task).await?;
         let now = self.store.now();
         if let Some(limit) = used_up_limit(&task, &config, now, false) {
-            task.transition(
-                TaskState::LimitReached {
-                    reason: limit.into(),
-                },
-                now,
-            )?;
+            task.transition(config.limit_reached(limit, now)?, now)?;
             self.store
                 .save(&mut task, &format!("limit_reached:{limit}"), "agent")
                 .await?;

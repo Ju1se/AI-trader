@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ApprovalId, IdempotencyKey, TaskId};
 use crate::plan::{Plan, PlanStep};
+use crate::state::{TaskState, TimeoutAction, WaitMetadata};
 use crate::types::{
     AsOfDate, FilingDate, PeriodEndDate, SchemaError, UsdCents, WeightBps, require_non_empty,
 };
@@ -160,6 +161,8 @@ pub struct WaitPolicy {
     pub approval_ttl_s: i64,
     pub settle_window_s: i64,
     pub handoff_ack_ttl_s: i64,
+    /// How long a task out of budget waits for its owner before what is done is delivered.
+    pub limit_ttl_s: i64,
     pub approver_role: String,
     pub escalation_owner_id: String,
     pub backup_owner_id: String,
@@ -172,6 +175,7 @@ impl Default for WaitPolicy {
             approval_ttl_s: 24 * 3_600,
             settle_window_s: 72 * 3_600,
             handoff_ack_ttl_s: 4 * 3_600,
+            limit_ttl_s: 4 * 3_600,
             approver_role: "portfolio_approver".into(),
             escalation_owner_id: "risk_committee_lead".into(),
             backup_owner_id: "operations_on_call".into(),
@@ -200,6 +204,21 @@ impl TaskTypeConfig {
         }
         Plan::new(self.plan.clone())?;
         self.budget_limits.validate()
+    }
+
+    /// Diagram 4a: a task out of budget waits for the escalation owner, who grants more or
+    /// has what is done delivered; at the deadline, what is done is delivered.
+    pub fn limit_reached(&self, reason: &str, now: i64) -> Result<TaskState, SchemaError> {
+        let waits = &self.waits;
+        let wait = WaitMetadata::new(
+            &waits.escalation_owner_id,
+            now + waits.limit_ttl_s,
+            TimeoutAction::Deliver,
+        )?;
+        Ok(TaskState::LimitReached {
+            reason: reason.into(),
+            wait,
+        })
     }
 
     /// Diagram 3a: Tools not explicitly listed in `allowed_tools` return `None` and MUST be denied.

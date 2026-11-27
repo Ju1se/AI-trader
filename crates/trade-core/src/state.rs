@@ -24,6 +24,8 @@ pub enum TimeoutAction {
     Complete,
     /// Re-assign the hand-off to the backup owner.
     Escalate,
+    /// Verify and deliver what is done (a task out of budget nobody gave more).
+    Deliver,
 }
 
 impl TimeoutAction {
@@ -33,6 +35,7 @@ impl TimeoutAction {
             Self::Decline => "DECLINE",
             Self::Complete => "COMPLETE",
             Self::Escalate => "ESCALATE",
+            Self::Deliver => "DELIVER",
         }
     }
 
@@ -42,6 +45,7 @@ impl TimeoutAction {
             "DECLINE" => Ok(Self::Decline),
             "COMPLETE" => Ok(Self::Complete),
             "ESCALATE" => Ok(Self::Escalate),
+            "DELIVER" => Ok(Self::Deliver),
             other => Err(SchemaError(format!("unknown_timeout_action:{other}"))),
         }
     }
@@ -80,15 +84,27 @@ pub enum TaskState {
     Running,
     AwaitingInput(WaitMetadata),
     AwaitingApproval(WaitMetadata),
-    OutcomeUnknown { frozen_action_key: IdempotencyKey },
-    LimitReached { reason: String },
+    OutcomeUnknown {
+        frozen_action_key: IdempotencyKey,
+    },
+    /// Out of turns, spend or time. The owner grants more or has what is done delivered.
+    LimitReached {
+        reason: String,
+        wait: WaitMetadata,
+    },
     Verifying,
     Settling(WaitMetadata),
     Completed,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
     HandedOff(WaitMetadata),
-    Declined { reason: String },
-    Cancelled { reason: String },
+    Declined {
+        reason: String,
+    },
+    Cancelled {
+        reason: String,
+    },
 }
 
 impl TaskState {
@@ -115,7 +131,8 @@ impl TaskState {
             Self::AwaitingInput(w)
             | Self::AwaitingApproval(w)
             | Self::Settling(w)
-            | Self::HandedOff(w) => Some(w),
+            | Self::HandedOff(w)
+            | Self::LimitReached { wait: w, .. } => Some(w),
             _ => None,
         }
     }
@@ -123,7 +140,7 @@ impl TaskState {
     pub fn detail(&self) -> Option<&str> {
         match self {
             Self::OutcomeUnknown { frozen_action_key } => Some(frozen_action_key.as_str()),
-            Self::LimitReached { reason }
+            Self::LimitReached { reason, .. }
             | Self::Failed { reason }
             | Self::Declined { reason }
             | Self::Cancelled { reason } => Some(reason),
@@ -167,7 +184,10 @@ impl TaskState {
                     frozen_action_key: IdempotencyKey::new(detail),
                 }
             }
-            "LIMIT_REACHED" => Self::LimitReached { reason: detail },
+            "LIMIT_REACHED" => Self::LimitReached {
+                reason: detail,
+                wait: wait(code)?,
+            },
             "VERIFYING" => Self::Verifying,
             "SETTLING" => Self::Settling(wait(code)?),
             "COMPLETED" => Self::Completed,
@@ -195,7 +215,10 @@ impl TaskState {
             Self::OutcomeUnknown {
                 frozen_action_key: IdempotencyKey::new("-"),
             },
-            Self::LimitReached { reason: reason() },
+            Self::LimitReached {
+                reason: reason(),
+                wait: wait.clone(),
+            },
             Self::Verifying,
             Self::Settling(wait.clone()),
             Self::Completed,
@@ -296,6 +319,9 @@ pub struct TaskRecord {
     pub consecutive_denials: u32,
     pub reworks_used: u32,
     pub reopened_count: u32,
+    /// Turns and spend the owner added after a limit was reached (Diagram 4a).
+    pub granted_turns: u32,
+    pub granted_spend: UsdCents,
 }
 
 impl TaskRecord {
@@ -328,6 +354,8 @@ impl TaskRecord {
             consecutive_denials: 0,
             reworks_used: 0,
             reopened_count: 0,
+            granted_turns: 0,
+            granted_spend: UsdCents::ZERO,
         };
         task.validate()?;
         Ok(task)

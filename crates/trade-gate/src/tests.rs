@@ -964,12 +964,16 @@ fn used_up_limit_moves_the_task_to_limit_reached() {
         run_with(&ledger, &tool, &next).unwrap_err(),
         PreDispatchError::LimitReached("max_turns".into()).into()
     );
+    let state = ledger.task().state().clone();
     assert_eq!(
-        ledger.task().state(),
-        &TaskState::LimitReached {
-            reason: "max_turns".into()
-        }
+        (state.code(), state.detail()),
+        ("LIMIT_REACHED", Some("max_turns"))
     );
+    // Diagram 4a: it waits for the escalation owner, and at the deadline what is done is
+    // delivered.
+    let wait = state.wait_meta().unwrap();
+    assert_eq!(wait.owner_id, "risk_committee_lead");
+    assert_eq!(wait.timeout_action, trade_core::TimeoutAction::Deliver);
 }
 
 #[test]

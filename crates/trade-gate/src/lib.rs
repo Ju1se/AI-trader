@@ -373,6 +373,15 @@ fn check_approval(
     Ok(())
 }
 
+/// The limits an owner can lift for one task (Diagram 4a): more turns or spend, and the
+/// working time and the run of refusals start again. Reworks and retries cannot be bought.
+pub const GRANTABLE_LIMITS: [&str; 4] = [
+    "max_turns",
+    "max_spend",
+    "max_wall_clock",
+    "max_consecutive_denials",
+];
+
 /// The first limit this task has used up, if any. Execution may not touch the spend
 /// reserved for closing.
 pub fn used_up_limit(
@@ -387,8 +396,15 @@ pub fn used_up_limit(
     });
     let max_wall_ms = i64::try_from(limits.max_wall_ms).unwrap_or(i64::MAX);
     [
-        (task.turns_used >= limits.max_turns, "max_turns"),
-        (task.spend >= limits.usable_execution_spend(), "max_spend"),
+        (
+            task.turns_used >= limits.max_turns + task.granted_turns,
+            "max_turns",
+        ),
+        (
+            task.spend.cents()
+                >= limits.usable_execution_spend().cents() + task.granted_spend.cents(),
+            "max_spend",
+        ),
         (running_ms > max_wall_ms, "max_wall_clock"),
         (
             is_retry && task.retries_used >= limits.max_retries,
@@ -501,12 +517,7 @@ async fn prepare_once<L: GateLedger, T: Tool>(
             Err(reason.into())
         }
         Verdict::Limit(limit) => {
-            task.transition(
-                TaskState::LimitReached {
-                    reason: limit.clone(),
-                },
-                now,
-            )?;
+            task.transition(ctx.config.limit_reached(&limit, now)?, now)?;
             ledger
                 .save_task(&task, &format!("limit_reached:{limit}"))
                 .await?;

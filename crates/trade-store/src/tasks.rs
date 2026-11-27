@@ -53,6 +53,8 @@ pub(crate) struct TaskRow {
     consecutive_denials: i64,
     reworks_used: i64,
     reopened_count: i64,
+    granted_turns: i64,
+    granted_spend_cents: i64,
 }
 
 impl TryFrom<TaskRow> for TaskRecord {
@@ -86,6 +88,8 @@ impl TryFrom<TaskRow> for TaskRecord {
         task.consecutive_denials = count(r.consecutive_denials)?;
         task.reworks_used = count(r.reworks_used)?;
         task.reopened_count = count(r.reopened_count)?;
+        task.granted_turns = count(r.granted_turns)?;
+        task.granted_spend = UsdCents::from_cents(r.granted_spend_cents);
         Ok(task)
     }
 }
@@ -212,9 +216,9 @@ pub(crate) async fn save_in(
         "UPDATE tasks SET state_code = $1, state_detail = $2, wait_owner = $3,
              wait_deadline_epoch_s = $4, wait_timeout_action = $5, running_since_epoch_s = $6,
              turns_used = $7, spend_cents = $8, retries_used = $9, consecutive_denials = $10,
-             reworks_used = $11, reopened_count = $12, updated_epoch_s = $13,
-             version = version + 1
-         WHERE task_id = $14 AND version = $15",
+             reworks_used = $11, reopened_count = $12, granted_turns = $13,
+             granted_spend_cents = $14, updated_epoch_s = $15, version = version + 1
+         WHERE task_id = $16 AND version = $17",
     )
     .bind(task.state().code())
     .bind(task.state().detail())
@@ -228,6 +232,8 @@ pub(crate) async fn save_in(
     .bind(i64::from(task.consecutive_denials))
     .bind(i64::from(task.reworks_used))
     .bind(i64::from(task.reopened_count))
+    .bind(i64::from(task.granted_turns))
+    .bind(task.granted_spend.cents())
     .bind(now)
     .bind(task.task_id.as_str())
     .bind(task.version())
@@ -489,7 +495,8 @@ impl Store {
     pub async fn due_waits(&self, now: i64) -> Result<Vec<TaskRecord>, GateError> {
         let rows = sqlx::query_as::<_, TaskRow>(
             "SELECT * FROM tasks WHERE wait_deadline_epoch_s <= $1
-             AND state_code IN ('AWAITING_INPUT', 'AWAITING_APPROVAL', 'SETTLING', 'HANDED_OFF')
+             AND state_code IN ('AWAITING_INPUT', 'AWAITING_APPROVAL', 'LIMIT_REACHED',
+                                'SETTLING', 'HANDED_OFF')
              ORDER BY wait_deadline_epoch_s, task_id",
         )
         .bind(now)

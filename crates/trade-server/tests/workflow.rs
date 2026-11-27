@@ -391,12 +391,19 @@ async fn verification_fails_without_any_evidence() {
 
 /// A used-up limit stops the work; what was finished is verified and delivered as partial.
 #[tokio::test]
-async fn a_used_up_limit_delivers_what_was_finished() {
+async fn a_used_up_limit_waits_for_the_owner_then_delivers_what_was_finished() {
     // Research takes 21 turns, asking for the draft's approval one, writing it one more.
     let h = common::harness_with(|t| t.budget_limits.max_turns = 23).await;
     let task = common::start(&h, "2026-02-10").await;
     let step = h.advance(&task).await.unwrap();
-    let step = common::approve(&h, step).await;
+    assert_eq!(
+        common::approve(&h, step).await,
+        Step::Waiting("LIMIT_REACHED")
+    );
+    let waiting = h.task(&task).await.unwrap();
+    let wait = waiting.state().wait_meta().unwrap();
+    assert_eq!(wait.owner_id, h.task_type.waits.escalation_owner_id);
+    let step = h.deliver_what_is_done(&task).await.unwrap();
     let Step::Delivered(manifest) = step else {
         panic!("{step:?}")
     };
@@ -412,6 +419,61 @@ async fn a_used_up_limit_delivers_what_was_finished() {
     let actions = h.store.actions(&task).await.unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].tool_name, DRAFT_TOOL);
+}
+
+/// Diagram 4a: the owner grants more turns and the task runs to the end, orders included.
+#[tokio::test]
+async fn the_owner_grants_more_budget_and_the_task_finishes() {
+    let h = common::harness_with(|t| t.budget_limits.max_turns = 23).await;
+    let task = common::start(&h, "2026-02-10").await;
+    let step = h.advance(&task).await.unwrap();
+    assert_eq!(
+        common::approve(&h, step).await,
+        Step::Waiting("LIMIT_REACHED")
+    );
+    let owner = h.task_type.waits.escalation_owner_id.clone();
+    let more = trade_core::UsdCents::from_cents(0);
+    let requester = h.task(&task).await.unwrap().requester_id;
+    let own = h.grant_budget(&task, &requester, 10, more, "mine").await;
+    assert!(
+        own.unwrap_err()
+            .to_string()
+            .contains("separation_of_duties"),
+        "the requester cannot raise their own budget"
+    );
+    h.grant_budget(&task, &owner, 10, more, "finish the orders")
+        .await
+        .unwrap();
+    let step = h.advance(&task).await.unwrap();
+    let Step::Delivered(manifest) = common::approve(&h, step).await else {
+        panic!("expected a delivery")
+    };
+    assert_eq!(manifest.completeness, Completeness::Complete);
+    assert_eq!(h.task(&task).await.unwrap().granted_turns, 10);
+    assert_eq!(h.broker.count_orders_for_task(&task), 1);
+}
+
+/// Reworks and retries cannot be bought: a task stopped by them can only deliver.
+#[tokio::test]
+async fn a_grant_cannot_buy_more_reworks() {
+    let h = common::harness().await;
+    let task = common::start(&h, "2026-02-10").await;
+    let mut record = h.task(&task).await.unwrap();
+    let now = h.store.now();
+    let stopped = h.task_type.limit_reached("max_reworks", now).unwrap();
+    record.transition(stopped, now).unwrap();
+    h.store
+        .save(&mut record, "limit_reached:max_reworks", "test")
+        .await
+        .unwrap();
+    let owner = h.task_type.waits.escalation_owner_id.clone();
+    let more = trade_core::UsdCents::from_cents(0);
+    let refused = h.grant_budget(&task, &owner, 10, more, "more").await;
+    assert!(
+        matches!(refused, Err(trade_core::GateError::StateTransition(_))),
+        "{refused:?}"
+    );
+    assert_eq!(state(&h.task(&task).await.unwrap()), "LIMIT_REACHED");
 }
 
 /// The broker credential is checked before anything is sent.

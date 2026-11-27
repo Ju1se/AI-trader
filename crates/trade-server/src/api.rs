@@ -25,7 +25,7 @@ use tower_http::cors::{Any, CorsLayer};
 use trade_adapters::BrokerFault;
 use trade_core::{
     ActionIntentRecord, ApprovalId, ApprovalRecord, ApprovalStatus, GateError, PreDispatchError,
-    RiskTier, TaskId, TaskRecord, TaskState, TaskTypeConfig,
+    RiskTier, TaskId, TaskRecord, TaskState, TaskTypeConfig, UsdCents,
 };
 
 use crate::workflow::{Framing, Harness, Step, TaskRequest};
@@ -215,6 +215,7 @@ impl App {
             .route("/tasks/{id}/cancel", post(cancel))
             .route("/tasks/{id}/reopen", post(reopen))
             .route("/tasks/{id}/hand-back", post(hand_back))
+            .route("/tasks/{id}/limit", post(limit))
             .route("/approvals", get(list_approvals))
             .route("/approvals/{id}", get(approval_detail))
             .route("/approvals/{id}/decision", post(decide))
@@ -326,6 +327,8 @@ fn task_view(t: &TaskRecord) -> Value {
             "consecutive_denials": t.consecutive_denials,
             "reworks": t.reworks_used,
             "reopened": t.reopened_count,
+            "granted_turns": t.granted_turns,
+            "granted_spend_usd": t.granted_spend.to_dollars(),
         },
         "allowed_next_states": t.state().next_codes(),
     })
@@ -503,6 +506,18 @@ struct SettleBody {
     comment: String,
     #[serde(default)]
     review_minutes: f64,
+}
+
+#[derive(Deserialize)]
+struct LimitBody {
+    /// `grant` or `deliver`.
+    decision: String,
+    #[serde(default)]
+    extra_turns: u32,
+    #[serde(default)]
+    extra_spend_usd: f64,
+    #[serde(default)]
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -717,6 +732,48 @@ async fn settle(
             )));
         }
     };
+    updated(&app, &id).await
+}
+
+/// Diagram 4a: the owner a task out of budget waits for grants more, or has what is done
+/// delivered.
+async fn limit(
+    State(app): State<App>,
+    User(user): User,
+    Path(id): Path<String>,
+    Body(body): Body<LimitBody>,
+) -> ApiResult<Json<Value>> {
+    let h = app.harness();
+    let id = TaskId::new(id);
+    let task = h.task(&id).await?;
+    let TaskState::LimitReached { wait, .. } = task.state() else {
+        return Err(conflict(
+            "not_limit_reached",
+            "the task has not reached a limit",
+        ));
+    };
+    if user != wait.owner_id {
+        return Err(forbidden(
+            "not_allowed",
+            "only the owner the task waits for decides",
+        ));
+    }
+    match body.decision.as_str() {
+        "grant" if body.extra_turns > 0 || body.extra_spend_usd > 0.0 => {
+            let spend = UsdCents::from_dollars(body.extra_spend_usd.max(0.0));
+            h.grant_budget(&id, &user, body.extra_turns, spend, &body.reason)
+                .await?;
+        }
+        "grant" => return Err(invalid("a grant needs extra_turns or extra_spend_usd")),
+        "deliver" => {
+            h.deliver_what_is_done(&id).await?;
+        }
+        other => {
+            return Err(invalid(format!(
+                "decision must be grant or deliver, not {other:?}"
+            )));
+        }
+    }
     updated(&app, &id).await
 }
 

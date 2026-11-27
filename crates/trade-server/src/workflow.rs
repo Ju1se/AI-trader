@@ -16,7 +16,7 @@ use trade_core::{
     TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, TransitionError,
     UsdCents, WaitMetadata, sha256_hex,
 };
-use trade_gate::{DispatchResult, GateOutcome, GateRequest, run};
+use trade_gate::{DispatchResult, GRANTABLE_LIMITS, GateOutcome, GateRequest, run};
 use trade_quant::{QuantSecurityResult, score_pit_universe};
 use trade_research::TargetPortfolio;
 use trade_store::{MemoryItem, Store};
@@ -432,7 +432,7 @@ impl Harness {
                     Some(agent) => self.act_with_model(task, agent).await?,
                     None => self.act(task).await?,
                 },
-                TaskState::LimitReached { .. } => self.close(task).await?,
+                // Out of budget: the owner grants more or has what is done delivered.
                 TaskState::OutcomeUnknown { .. } => {
                     if self.reconcile(task_id).await? {
                         None
@@ -648,7 +648,7 @@ impl Harness {
     /// rework: the loop goes round again.
     pub(crate) async fn close(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
         let from_limit = match task.state() {
-            TaskState::LimitReached { reason } => Some(reason.clone()),
+            TaskState::LimitReached { reason, .. } => Some(reason.clone()),
             _ => None,
         };
         task.transition(TaskState::Verifying, self.store.now())?;
@@ -898,6 +898,50 @@ impl Harness {
             .await
     }
 
+    /// Diagram 4a: the owner of a task out of budget grants more turns and spend, and the
+    /// task runs again. The run of refusals starts over; working time does by itself.
+    pub async fn grant_budget(
+        &self,
+        task_id: &TaskId,
+        owner: &str,
+        extra_turns: u32,
+        extra_spend: UsdCents,
+        reason: &str,
+    ) -> Result<TaskRecord, GateError> {
+        let mut task = self.task(task_id).await?;
+        let TaskState::LimitReached { reason: limit, .. } = task.state() else {
+            return Err(not_now(&task, "RUNNING"));
+        };
+        if !GRANTABLE_LIMITS.contains(&limit.as_str()) {
+            return Err(not_now(&task, "RUNNING"));
+        }
+        // Separation of duties, as for approvals: nobody raises the budget of their own task.
+        if owner == task.requester_id {
+            return Err(PreDispatchError::SeparationOfDutiesViolation(owner.into()).into());
+        }
+        task.granted_turns += extra_turns;
+        task.granted_spend = UsdCents::from_cents(task.granted_spend.cents() + extra_spend.cents());
+        task.consecutive_denials = 0;
+        task.transition(TaskState::Running, self.store.now())?;
+        let note = format!(
+            "budget_granted:+{extra_turns}_turns,+{}_cents:{reason}",
+            extra_spend.cents()
+        );
+        self.store.save(&mut task, &note, owner).await?;
+        Ok(task)
+    }
+
+    /// Diagram 4a: the owner of a task out of budget has what is done verified and
+    /// delivered, as the deadline would.
+    pub async fn deliver_what_is_done(&self, task_id: &TaskId) -> Result<Step, GateError> {
+        let task = self.task(task_id).await?;
+        if !matches!(task.state(), TaskState::LimitReached { .. }) {
+            return Err(not_now(&task, "VERIFYING"));
+        }
+        // From a limit, CLOSE delivers or hands over; it never sends the task back to work.
+        Ok(self.close(task).await?.unwrap_or(Step::Waiting("RUNNING")))
+    }
+
     /// SETTLE: the requester accepts the delivery.
     pub async fn confirm_settlement(
         &self,
@@ -1113,6 +1157,10 @@ impl Harness {
             TaskState::Settling(_) => {
                 self.confirm_settlement(&task.task_id, "settlement_window", 0.0)
                     .await?;
+            }
+            // Nobody gave more budget: verify and deliver what is done.
+            TaskState::LimitReached { .. } => {
+                self.close(task).await?;
             }
             TaskState::HandedOff(wait) => {
                 let waits = &config.waits;

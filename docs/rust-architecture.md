@@ -165,13 +165,13 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 - **模型看到的**:`prompts/agent.md` 里的说明(上限由配置填进去)、任务合约、最近 16 条对话记录,以及每轮从库里现读的状态:用量、草稿、动作、批准、上次验收的缺口。
 - **对话记录存在库里**:模型的每一句和得到的每个结果都写进任务时间线(`agent.reply`、`agent.observation`),所以等批准、重启之后都能接着做。
 - **批准的是确切内容**:人批准之后,按批准记录里的内容原样发出,不再问模型。
-- **上限照样管用**:模型的每一句回复算一轮;回复不是合法提议、提议了不存在的工具,都算一次被拒。轮数或连续被拒用完,任务进入 `LIMIT_REACHED`,验收已完成的部分。
+- **上限照样管用**:模型的每一句回复算一轮;回复不是合法提议、提议了不存在的工具,都算一次被拒。轮数、花费、时间或连续被拒用完,任务进入 `LIMIT_REACHED` 等负责人:加了额度就接着做,不管就到期交付已完成的部分。
 - **业务规则在执行前检查**:单只、行业、流动性、持仓数的上限在闸门里就检查(`limit_breaches`),验收时用同一个函数再查一遍。模型定的权重不合规,写草稿之前就被拒,原因告诉模型。
 - **接口**:任何 OpenAI 兼容的地址都行(Ollama、vLLM、llama.cpp);现在只走 HTTP,要连 HTTPS 的托管服务时给 reqwest 加 TLS 特性。
 
 测试用一个按脚本回答的假模型,跑在真实的 HTTP 接口上(`crates/trade-server/tests/agent.rs`),检查模型被拒后看到的原因、批准后的原样发出、否决下单后的部分交付、乱回答和不收手时的上限。
 
-真模型用 `notebooks/scenarios.py` 测:通过接口跑一个成功案例和十个对抗案例(人否决、批准过期、违反规则的要求、资料里的提示注入、请求不完整、券商出错),按系统状态判定,统计被拒、人否决、改正的次数和每个完成任务的成本。同一组场景先在固定规则上跑,再让模型跑,用来回答导图 6 FALSIFY 的问题:更简单的流程够不够用。Colab 笔记本的第 7 节就是这样跑的。
+真模型用 `notebooks/scenarios.py` 测:通过接口跑一个成功案例和十二个对抗案例(人否决、批准过期、违反规则的要求、资料里的提示注入、请求不完整、券商出错、运行超时后负责人加额度或没人管),按系统状态判定,统计被拒、人否决、改正的次数和每个完成任务的成本。同一组场景先在固定规则上跑,再让模型跑,用来回答导图 6 FALSIFY 的问题:更简单的流程够不够用。Colab 笔记本的第 7 节就是这样跑的。
 
 ## 6. 高频试错:改了之后多快能看到结果
 
@@ -191,7 +191,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 | core、gate | 迁移表和图 4a 逐条一致;随机事件序列走不到非法状态;闸门九步的顺序和每一道的拒绝;批准的每种失效;读到旧数据时不会覆盖并发的否决 | 属性测试(proptest);表驱动测试;闸门用内存里的账本,不需要异步运行时 |
 | quant、research、adapters | 4 个调仓日的股票池、分数、否决、委员会结论、权重,以及回测指标,都和 Python 版一致;时点规则 | 和基准文件比对,浮点按容差 |
 | store | 版本号冲突、批准只能用一次、没发出去的动作退回批准、结果未知时不能取消、单位成本口径、到期查询、外键 | 每个测试一个新的 SQLite 库;设置 `TRADE_TEST_PG_URL` 后每个测试一个新的 PostgreSQL 库(在 Colab 的 PostgreSQL 16 上全部通过) |
-| server | 用例端到端:两条否决路径、到期处理、两种券商故障、重启后对账、返工、触上限、篡改的引用;HTTP 接口的身份、错误码、去重、事件流、联调接口;模型驱动的循环:读写都过闸门、被拒后改正、批准后原样发出、触上限 | 真实的用例和模拟券商;axum 在进程内调用;模型是一个按脚本回答的 HTTP 服务 |
+| server | 用例端到端:两条否决路径、到期处理、两种券商故障、重启后对账、返工、触上限后加额度或到期交付、篡改的引用;HTTP 接口的身份、错误码、去重、事件流、联调接口;模型驱动的循环:读写都过闸门、被拒后改正、批准后原样发出、触上限 | 真实的用例和模拟券商;axum 在进程内调用;模型是一个按脚本回答的 HTTP 服务 |
 
 ## 7. 每张图落在哪里
 
@@ -202,12 +202,12 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 | 图 2 定义阶段 | `Harness::frame` 定合约或提问,并存计划第 1 版;闸门第 5 道拒绝没就绪或已跳过的步骤,固定规则和模型两条路都受它约束;研究阶段专家只拿只读视图 | `ambiguous_request_waits_for_an_answer_then_goes_to_a_person`、`the_plan_orders_the_steps_and_a_refused_step_stays_dropped`、`refused_orders_are_skipped_and_the_draft_delivered_as_partial`;`plan.rs` 的拓扑排序和环检测有属性测试 |
 | 图 3a 闸门 | `gate::decide` | `refusals_follow_diagram_3a_in_order` 等 4 个表驱动测试 |
 | 图 3b 批准 | store 的批准表和事务;`Harness::decide_approval`(绕开或被否决) | `approval_is_used_once_for_exactly_its_payload`、`a_rejection_after_the_gate_read_wins`、`refused_orders_are_skipped_and_the_draft_delivered_as_partial`、`refusing_a_required_step_declines_the_task` |
-| 图 4a 状态机 | `core/src/state.rs` 的迁移表;store 带版本号的更新 | `transition_table_matches_diagram_4a_exactly`、`random_walks_keep_diagram_invariants`、`stale_copy_cannot_overwrite_a_newer_write` |
+| 图 4a 状态机 | `core/src/state.rs` 的迁移表;store 带版本号的更新;触上限也是等待状态,`Harness::grant_budget` 加额度回到运行,`deliver_what_is_done` 和到期处理交付已完成的部分 | `transition_table_matches_diagram_4a_exactly`、`random_walks_keep_diagram_invariants`、`stale_copy_cannot_overwrite_a_newer_write`、`the_owner_grants_more_budget_and_the_task_finishes`、`a_used_up_limit_waits_for_the_owner_then_delivers_what_was_finished`、`a_grant_cannot_buy_more_reworks` |
 | 图 4b 恢复 | `Harness::reconcile`、`Harness::recover`(启动时);两个工具按幂等键回读 | `a_request_lost_before_the_broker_is_reconciled_and_sent_once`、`a_lost_reply_after_a_fill_is_reconciled_without_a_second_order`、`a_restart_settles_what_a_crash_left_in_flight` |
 | 图 5 场景 | 命令行 `agent`、`research`、`backtest` | `tests/parity.rs` 和 Python 基准逐项比对 |
 | 图 6 收尾与度量 | `Harness::verify`(只读库、行情和券商)、交付、验收、到期结案;store 的单位成本 | `a_tampered_citation_fails_verification_and_goes_to_a_person`、`verification_fails_without_any_evidence`、`spend_limit_sees_every_cost_and_unit_economics_counts_ended_tasks_once` |
 | 图 7 组件 | crate 划分;`server/src/api.rs` 的接口和事件流 | `tests/api.rs` |
-| 图 8 数据模型 | `migrations/0001_schema.sql` | store 的测试,SQLite 和 PostgreSQL 16 上都跑过 |
+| 图 8 数据模型 | `migrations/0001_schema.sql`;`0002_plans.sql` 存计划的各个版本(PLAN);`0003_budget_grants.sql` 记负责人加的额度 | store 的测试,SQLite 和 PostgreSQL 16 上都跑过 |
 
 ## 8. 改进清单和完成情况
 
@@ -252,11 +252,12 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 | 编号 | 问题 | 结果 |
 |---|---|---|
-| E1 | 等待期限写死在 2099 年,没有到期处理 | 已完成:期限按任务类型配置算;后台每 30 秒处理到期:没回答转人工,没批准按否决,没异议按验收结案,没人接手转给备用负责人 |
+| E1 | 等待期限写死在 2099 年,没有到期处理 | 已完成:期限按任务类型配置算;后台每 30 秒处理到期:没回答转人工,没批准按否决,没异议按验收结案,没人接手转给备用负责人,触上限没人管就交付已完成的部分 |
 | E2 | 墙上时间上限没人传 | 已完成:任务记着最近一次进入运行的时间,闸门自己算。等人的时间不计入 |
 | E3 | 验收、交付、结案、交接、重开、恢复都没有 | 已完成,见第 7 节 |
 | E4 | 审计、记分卡、`/v1` 接口和事件流没有 | 已完成,见 [`api.md`](api.md)。还没有 OpenAPI 文件 |
 | E5 | 单位成本口径错 | 已完成:只算已结束任务的全部成本,重开后再完成只算一次 |
+| E6 | 触上限后只能验收已完成的部分,图 4a 的「负责人加额度,回到运行中」没有 | 已完成:`LIMIT_REACHED` 和其他等待一样有负责人(`escalation_owner_id`)、期限(`limit_ttl_s`,默认 4 小时)和到期动作(`DELIVER`)。负责人加轮数或花费就回到运行,连续被拒清零,时间重新算;不管就到期交付。发起人不能给自己的任务加;返工和重试次数加不了。接口是 `POST /v1/tasks/{id}/limit`,额度记在 `migrations/0003_budget_grants.sql` 加的两列 |
 
 ### 8.6 结构和代码量
 
@@ -280,7 +281,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 ### 8.8 还没做的
 
-- OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
+- OpenAPI 文件;真实登录和角色;多实例下的对账租约。
 - 用模型当专家(现在模型只做主 Agent 的提议);由后台任务自动推进 `advance`。
 
 ## 9. 里程碑
