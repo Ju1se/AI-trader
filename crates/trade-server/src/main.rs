@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
-//! Command line: `trade <serve|demo|backtest|research|bench> [--db URL] [--root DIR]
-//! [--as-of DATE] [--addr HOST:PORT] [--dev]`. The numbers match the Python MVP
-//! (`v0.1-python-mvp`) item by item.
+//! Command line: `trade <serve|agent|demo|backtest|research|bench> [--db URL] [--root DIR]
+//! [--as-of DATE] [--addr HOST:PORT] [--dev] [--model-url URL --model NAME]
+//! [--approve-as NAME]`. The numbers match the Python MVP (`v0.1-python-mvp`) item by item.
+//!
+//! With `--model-url` and `--model` (or `AITRADER_MODEL_URL` and `AITRADER_MODEL`), a
+//! model behind an OpenAI-compatible API proposes every action; `AITRADER_MODEL_API_KEY`
+//! is sent if set. Without them, ACT follows fixed rules.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +14,8 @@ use std::time::Instant;
 
 use trade_core::{ActionIntentStatus, AsOfDate, PitMarketSource, TaskId};
 use trade_quant::{audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe};
-use trade_server::{App, FrameRequest, Framing, Harness, Intake, ORDER_TOOL, Step};
+use trade_server::agent::{OBSERVATION, REPLY};
+use trade_server::{AgentModel, App, FrameRequest, Framing, Harness, Intake, ORDER_TOOL, Step};
 
 struct Args {
     command: String,
@@ -19,6 +24,9 @@ struct Args {
     root: PathBuf,
     addr: String,
     dev: bool,
+    model_url: Option<String>,
+    model: Option<String>,
+    approve_as: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -30,6 +38,9 @@ fn parse_args() -> Args {
         root: PathBuf::new(),
         addr: "127.0.0.1:8000".into(),
         dev: std::env::var("AITRADER_ENABLE_DEV_ENDPOINTS").is_ok_and(|v| v == "true"),
+        model_url: std::env::var("AITRADER_MODEL_URL").ok(),
+        model: std::env::var("AITRADER_MODEL").ok(),
+        approve_as: None,
     };
     let mut root = None;
     let mut first = true;
@@ -40,6 +51,9 @@ fn parse_args() -> Args {
             "--root" => root = args.next().map(PathBuf::from),
             "--addr" => parsed.addr = args.next().unwrap_or_default(),
             "--dev" => parsed.dev = true,
+            "--model-url" => parsed.model_url = args.next(),
+            "--model" => parsed.model = args.next(),
+            "--approve-as" => parsed.approve_as = args.next(),
             command if first => parsed.command = command.into(),
             _ => {}
         }
@@ -326,14 +340,60 @@ async fn serve(h: Harness, args: &Args) -> Result<(), String> {
         .map_err(err)
 }
 
+/// One task driven by the model, from framing to delivery. With `--approve-as`, that
+/// person approves each action as it comes; without it, the run stops at the first one.
+async fn agent(h: &Harness, args: &Args) -> Result<(), String> {
+    let key = trade_store::new_id(&format!("agent-{}", args.as_of));
+    let task = start(h, &key, &args.as_of).await?;
+    println!("task {task}");
+    let mut step = h.advance(&task).await.map_err(err)?;
+    while let Step::NeedsApproval { approval_id, tool } = &step {
+        let Some(person) = &args.approve_as else {
+            println!("{tool} waits for approval {approval_id}; decide it through the API.");
+            break;
+        };
+        println!("{person} approves {tool} ({approval_id})");
+        let note = Some("approved from the command line");
+        h.decide_approval(approval_id, person, true, note)
+            .await
+            .map_err(err)?;
+        step = h.advance(&task).await.map_err(err)?;
+    }
+    section("Transcript");
+    for e in h.store.events(&task).await.map_err(err)? {
+        match e.kind.as_str() {
+            REPLY => println!("model> {}", e.detail),
+            OBSERVATION => println!("harness> {}\n", e.detail),
+            _ => {}
+        }
+    }
+    section("Outcome");
+    let done = h.task(&task).await.map_err(err)?;
+    println!(
+        "state={} turns={} step={step:?}",
+        done.state().code(),
+        done.turns_used
+    );
+    Ok(())
+}
+
 async fn run() -> Result<(), String> {
     let args = parse_args();
-    let h = Harness::open(&args.root, &args.db).await?;
+    let mut h = Harness::open(&args.root, &args.db).await?;
+    if let (Some(url), Some(model)) = (&args.model_url, &args.model) {
+        let key = std::env::var("AITRADER_MODEL_API_KEY").ok();
+        h = h.with_agent(AgentModel::load(&args.root, url, model, key)?);
+    }
     if args.command == "serve" {
         return serve(h, &args).await;
     }
     let s = &h.strategy;
     match args.command.as_str() {
+        "agent" if h.agent.is_none() => Err(
+            "agent needs a model: --model-url URL --model NAME, or AITRADER_MODEL_URL and AITRADER_MODEL"
+                .into(),
+        ),
+        "agent" => agent(&h, &args).await,
         "demo" => demo(&h).await,
         "backtest" => {
             let bt = run_pit_backtest(&h.market, &s.rebalance_dates, &s.backtest, &s.factors)?;
@@ -377,7 +437,7 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?}; usage: trade <serve|demo|backtest|research|bench> [--db URL] [--root DIR] [--as-of DATE] [--addr HOST:PORT] [--dev]"
+            "unknown command {other:?}; usage: trade <serve|agent|demo|backtest|research|bench> [--db URL] [--root DIR] [--as-of DATE] [--addr HOST:PORT] [--dev] [--model-url URL --model NAME] [--approve-as NAME]"
         )),
     }
 }

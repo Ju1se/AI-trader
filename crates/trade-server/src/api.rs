@@ -487,7 +487,9 @@ struct DecisionBody {
 // ---- Handlers --------------------------------------------------------------------------------
 
 async fn health(State(app): State<App>) -> Json<Value> {
-    Json(json!({"status": "ok", "database": app.harness().store.backend()}))
+    let h = app.harness();
+    let model = h.agent.as_ref().map(|a| a.model.name());
+    Json(json!({"status": "ok", "database": h.store.backend(), "model": model}))
 }
 
 async fn states() -> Json<Value> {

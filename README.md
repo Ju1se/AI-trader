@@ -16,12 +16,14 @@
 | `crates/trade-research` | 三个专家和投资委员会。无 IO |
 | `crates/trade-gate` | 闸门:纯函数 `decide`(图 3a)和执行顺序 `run`。只定义接口,无 IO |
 | `crates/trade-store` | 唯一访问数据库的地方。SQLite 和 PostgreSQL 共用一套 SQL |
-| `crates/trade-adapters` | 外部系统:时点行情(读 `fixtures/`)和模拟券商 |
-| `crates/trade-server` | 用例(图 0)、两个受控工具、`/v1` 接口和事件流、命令行 |
+| `crates/trade-adapters` | 外部系统:时点行情(读 `fixtures/`)、模拟券商、OpenAI 兼容的模型接口 |
+| `crates/trade-server` | 用例(图 0)、模型驱动的执行循环、两个受控工具、`/v1` 接口和事件流、命令行 |
 | `config/strategy.toml` | 策略参数:因子权重和阈值、委员会、仓位上限、回测。改了不用重新编译 |
 | `config/task_types/` | 任务类型配置:工具的风险分级、上限、放权级别、等待期限 |
 | `fixtures/market.json` | 演示和测试用的时点数据 |
+| `prompts/agent.md` | 给模型的说明:可用的工具和规则。改了不用重新编译 |
 | `migrations/` | 数据库结构 |
+| `notebooks/colab.ipynb` | 在 Google Colab 上用本地模型跑全程的笔记本 |
 
 ## 常用命令
 
@@ -42,6 +44,19 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 ```
 
 接口默认在 `http://127.0.0.1:8000`,改用 `--addr`。不给 `--db` 时用内存数据库,进程退出数据就没了。
+
+## 接入模型
+
+模型只负责提议:每一轮提议一个工具调用,写操作都先过闸门,需要人批准的照样要人批准,结果和拒绝原因作为数据告诉模型。任何 OpenAI 兼容的接口都能用,例如本机的 Ollama:
+
+```bash
+ollama pull qwen2.5:7b-instruct
+cargo run -p trade-server --bin trade -- agent --model-url http://127.0.0.1:11434/v1 --model qwen2.5:7b-instruct --approve-as approver_bob
+```
+
+`agent` 用模型跑一个任务并打印对话记录;`--approve-as` 让这个人自动批准,不给就停在第一次批准上。`serve` 加上 `--model-url` 和 `--model` 之后,`POST /v1/tasks/{id}/advance` 由模型驱动。也可以用环境变量 `AITRADER_MODEL_URL`、`AITRADER_MODEL`、`AITRADER_MODEL_API_KEY`。不配置模型时,按固定规则推进。
+
+在 Google Colab 上用 GPU 和本地模型跑全程:打开 [`notebooks/colab.ipynb`](notebooks/colab.ipynb)。
 
 ## 用 PostgreSQL
 

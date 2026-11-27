@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `task_types` | TASK_TYPE_PROFILE | 任务类型配置(JSON):工具的风险分级、上限、放权级别、等待期限 | 主键 `(task_type, version)`。同一版本的内容不能变 |
 | `tasks` | TASK、AUTHORITY、WAIT | 任务和当前状态;执行身份和授权市场;当前等待的人、期限和到期动作;各项上限的用量 | `idempotency_trigger_key` 唯一;`version` 用于条件更新;外键指向 `task_types` |
-| `task_events` | SESSION_EVENT、AUDIT_RECORD | 时间线和审计记录,只追加:每次状态变化、拒绝、批准决定、动作、成本 | 主键 `(task_id, seq)`,每个任务从 1 连续编号 |
+| `task_events` | SESSION_EVENT、AUDIT_RECORD | 时间线和审计记录,只追加:每次状态变化、拒绝、批准决定、动作、成本,以及模型的对话记录(`agent.reply`、`agent.observation`) | 主键 `(task_id, seq)`,每个任务从 1 连续编号 |
 | `contracts` | TASK_CONTRACT | 任务合约(JSON) | 每个任务一行 |
 | `actions` | ACTION | 动作:工具、对象、参数、参数哈希、状态、外部回执 | 主键 `idempotency_key` |
 | `approvals` | APPROVAL | 批准:绑定的参数哈希、批准人、过期时间、状态 | 按 `(task_id, status)` 索引 |
@@ -53,7 +53,7 @@
 
 ## 上云
 
-1. 准备一个托管的 PostgreSQL,把连接串交给服务:`trade serve --db postgres://用户:密码@主机:5432/库名`。启动时自动建表。
+1. 准备一个托管的 PostgreSQL,把连接串交给服务:`trade serve --db postgres://用户:密码@主机:5432/库名`。启动时自动建表。托管数据库一般要求加密连接,现在的构建不带 TLS,要先在工作区的 `Cargo.toml` 里给 sqlx 加上 TLS 特性(例如 `tls-rustls`)。
 2. 上线前在 PostgreSQL 上把存储层的测试跑一遍:`TRADE_TEST_PG_URL=postgres://...:5432/postgres cargo test -p trade-store`。每个测试建一个新库,需要建库权限。本机可以用 `docker compose up -d db` 起一个。
 3. 连接池上限现在是 5,按实例数和数据库的连接上限调整。
 4. 现在假设只有一个服务进程:启动时对账的逻辑会把所有「已发出」的动作当作上次进程留下的。要跑多个实例,先给对账加上按实例的租约。

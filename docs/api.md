@@ -72,7 +72,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 
 | 方法和路径 | 用途 | 谁能调 |
 |---|---|---|
-| `GET /health` | 健康检查,带数据库类型 | 任何人 |
+| `GET /health` | 健康检查,带数据库类型和当前模型(没有为 `null`) | 任何人 |
 | `GET /v1/meta/states` | 状态表 | 任何人 |
 | `GET /v1/task-types` | 当前任务类型配置:工具风险分级、上限、放权级别、等待期限 | 任何人 |
 | `POST /v1/tasks` | 创建任务并定义合约,自动去重 | 已识别的用户,即发起人 |
@@ -166,7 +166,11 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 
 ## 推进
 
-`POST /v1/tasks/{id}/advance` 让 Agent 一直做下去,直到需要人:研究、写草稿、下单、验收、交付。可以随时、重复调用,每一步都从数据库重新读。返回 `{step, task}`,`step.kind` 有五种:
+`POST /v1/tasks/{id}/advance` 让 Agent 一直做下去,直到需要人:研究、写草稿、下单、验收、交付。可以随时、重复调用,每一步都从数据库重新读。
+
+服务配置了模型时(`serve --model-url ... --model ...`),每一轮由模型提议一个工具调用:研究、看筛选结果、读公告、写草稿(权重由模型定)、下单、完成。写操作先过闸门,结果、拒绝原因和验收缺口作为数据告诉模型,它据此修改提议。模型的每一句和得到的每个结果都写进时间线,`kind` 分别是 `agent.reply` 和 `agent.observation`。需要批准时同样停下;批准之后按批准的确切内容发出,不再问模型。没配置模型时按固定规则推进。一次推进可能要等模型几分钟,客户端的超时要留够。
+
+返回 `{step, task}`,`step.kind` 有五种:
 
 | `step.kind` | 意思 | 前端接着做什么 |
 |---|---|---|
@@ -323,4 +327,5 @@ curl -s -H "X-User-Id: alice" $B/v1/metrics/scorecard
 - 加额度(`LIMIT_REACHED` 之后继续做)的接口。现在只能验收已完成的部分。
 - 任务类型配置的增删改。现在从 `config/task_types/` 读,改了要重启并升版本号。
 - 事件流的身份校验和断线续传。
-- 模型。现在三个专家是确定性的规则,`advance` 由人或脚本调用;接入模型后由后台任务驱动。
+- 用模型当专家。现在模型只做主 Agent 的提议,三个专家还是确定性的规则。
+- 后台自动推进。现在 `advance` 由前端或脚本调用。

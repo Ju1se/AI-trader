@@ -375,7 +375,7 @@ fn check_approval(
 
 /// The first limit this task has used up, if any. Execution may not touch the spend
 /// reserved for closing.
-fn used_up_limit(
+pub fn used_up_limit(
     task: &TaskRecord,
     config: &TaskTypeConfig,
     now_epoch_s: i64,

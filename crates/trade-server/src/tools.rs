@@ -1,18 +1,20 @@
 //! The two governed write tools: the rebalance draft (R2) and paper orders (R3).
 //!
-//! Business rules are checked against facts the store holds (the stored veto list and the
-//! stored draft), never against what the proposer sends. Each tool also knows how to read
-//! its target system back by idempotency key, which is how recovery settles an action whose
-//! outcome was unknown.
+//! Business rules are checked against facts the store and the market data hold (the stored
+//! veto list, the contract, the stored draft, the as-of date's market data), never against
+//! what the proposer sends. Each tool also knows how to read its target system back by
+//! idempotency key, which is how recovery settles an action whose outcome was unknown.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use trade_adapters::{BrokerOrderReceipt, PaperBroker};
+use trade_adapters::{BrokerOrderReceipt, FixtureMarket, PaperBroker};
 use trade_core::{
-    ActionIntentRecord, ExecError, GateError, IdempotencyKey, PortfolioActionPayload,
-    PreDispatchError, RiskTier, TaskId, TaskRecord, UsdCents,
+    ActionIntentRecord, ExecError, GateError, IdempotencyKey, PitMarketSource, PitSecuritySnapshot,
+    PortfolioActionPayload, PreDispatchError, RiskTier, TaskContract, TaskId, TaskRecord, UsdCents,
+    WeightBps,
 };
 use trade_gate::{DispatchResult, Tool, VerifiedGateTicket};
+use trade_research::InvestmentCommittee;
 use trade_store::{Store, StoredDraft};
 
 pub const DRAFT_TOOL: &str = "create_rebalance_draft";
@@ -21,21 +23,82 @@ pub const ORDER_TOOL: &str = "submit_paper_orders";
 /// A backstop independent of the strategy settings: no single position above 45%.
 const MAX_POSITION_BPS: u16 = 4_500;
 
-/// What the portfolio rules are checked against, read from the store.
-#[derive(Debug, Clone, Default)]
+/// What the portfolio rules are checked against.
+#[derive(Debug, Clone)]
 pub struct PortfolioFacts {
     pub evaluated: BTreeSet<String>,
     pub vetoed: BTreeSet<String>,
+    pub contract: TaskContract,
+    /// The market data of the contract's date, for the liquidity and industry limits.
+    pub universe: Vec<PitSecuritySnapshot>,
     /// The stored draft the orders must match. Read only for orders.
     pub draft: Option<StoredDraft>,
 }
 
+/// Each way `weights` breaks the strategy's portfolio limits, given the market data of the
+/// as-of date: number of positions, total, single position, industry, and the share of a
+/// security's daily trading. Empty when it complies. The gate checks this before a draft
+/// or order is written, and the verifier checks it again afterwards.
+pub fn limit_breaches(
+    weights: &BTreeMap<String, WeightBps>,
+    universe: &[PitSecuritySnapshot],
+    committee: &InvestmentCommittee,
+    contract: &TaskContract,
+) -> Vec<String> {
+    let mut breaches = Vec::new();
+    if weights.len() > contract.max_positions {
+        breaches.push(format!(
+            "too_many_positions:{}>{}",
+            weights.len(),
+            contract.max_positions
+        ));
+    }
+    let total: u32 = weights.values().map(|w| u32::from(w.bps())).sum();
+    if total > 10_000 {
+        breaches.push("total_weight_exceeds_10000_bps".into());
+    }
+    let row: BTreeMap<&str, &PitSecuritySnapshot> =
+        universe.iter().map(|s| (s.ticker.as_str(), s)).collect();
+    let capital = contract.portfolio_capital.to_dollars().max(1.0);
+    let mut by_industry: BTreeMap<&str, u32> = BTreeMap::new();
+    for (ticker, weight) in weights {
+        let Some(s) = row.get(ticker.as_str()) else {
+            breaches.push(format!("not_in_universe:{ticker}"));
+            continue;
+        };
+        if weight.bps() > committee.max_single_weight.bps() {
+            breaches.push(format!("single_weight_exceeded:{ticker}"));
+        }
+        let adv_cap =
+            WeightBps::from_ratio_clamped(committee.max_adv_participation * s.adv_usd / capital);
+        // One basis point of slack for rounding.
+        if weight.bps() > adv_cap.bps().saturating_add(1) {
+            breaches.push(format!("adv_cap_exceeded:{ticker}"));
+        }
+        *by_industry.entry(s.industry.as_str()).or_default() += u32::from(weight.bps());
+    }
+    for (industry, bps) in by_industry {
+        if bps > u32::from(committee.max_industry_weight.bps()) {
+            breaches.push(format!("industry_weight_exceeded:{industry}"));
+        }
+    }
+    breaches
+}
+
 async fn load_portfolio_facts(
     store: &Store,
+    market: &FixtureMarket,
     task: &TaskRecord,
     draft_id: Option<&str>,
 ) -> Result<PortfolioFacts, GateError> {
     let decisions = store.evaluations(&task.task_id).await?;
+    let contract = store
+        .contract(&task.task_id)
+        .await?
+        .ok_or_else(|| GateError::Storage(format!("contract_not_found:{}", task.task_id)))?;
+    let universe = market
+        .get_pit_snapshot(&contract.as_of_date, &contract.universe_markets)
+        .map_err(GateError::Storage)?;
     let draft = match draft_id {
         Some(id) => store.draft(id).await?,
         None => None,
@@ -47,6 +110,8 @@ async fn load_portfolio_facts(
             .filter(|d| d.hard_veto)
             .map(|d| d.ticker.clone())
             .collect(),
+        contract,
+        universe,
         draft,
     })
 }
@@ -55,6 +120,7 @@ fn check_portfolio(
     args: &PortfolioActionPayload,
     task: &TaskRecord,
     facts: &PortfolioFacts,
+    committee: &InvestmentCommittee,
 ) -> Result<(), PreDispatchError> {
     use PreDispatchError::{BusinessRuleViolation as Rule, InvalidArguments, UnauthorizedMarket};
     if args.draft_id.trim().is_empty() {
@@ -92,7 +158,16 @@ fn check_portfolio(
             return Err(Rule(format!("vetoed_ticker_in_portfolio:{ticker}")));
         }
     }
-    Ok(())
+    let breaches = limit_breaches(
+        &args.weights_bps,
+        &facts.universe,
+        committee,
+        &facts.contract,
+    );
+    match breaches.into_iter().next() {
+        Some(breach) => Err(Rule(breach)),
+        None => Ok(()),
+    }
 }
 
 fn canonical(args: &PortfolioActionPayload) -> Result<String, PreDispatchError> {
@@ -109,6 +184,8 @@ fn payload_of(action: &ActionIntentRecord) -> Result<PortfolioActionPayload, Gat
 /// type's autonomy level asks for it.
 pub struct CreateDraft {
     pub store: Store,
+    pub market: FixtureMarket,
+    pub committee: InvestmentCommittee,
 }
 
 impl CreateDraft {
@@ -160,7 +237,7 @@ impl Tool for CreateDraft {
         task: &TaskRecord,
         _: &Self::Args,
     ) -> Result<Self::Facts, GateError> {
-        load_portfolio_facts(&self.store, task, None).await
+        load_portfolio_facts(&self.store, &self.market, task, None).await
     }
 
     fn check(
@@ -169,7 +246,7 @@ impl Tool for CreateDraft {
         task: &TaskRecord,
         facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
-        check_portfolio(args, task, facts)
+        check_portfolio(args, task, facts, &self.committee)
     }
 
     async fn execute(
@@ -199,6 +276,8 @@ impl Tool for CreateDraft {
 /// R3: place the paper orders for the stored draft. Always needs a person's approval.
 pub struct SubmitOrders {
     pub store: Store,
+    pub market: FixtureMarket,
+    pub committee: InvestmentCommittee,
     pub broker: PaperBroker,
     /// Held outside every worker and model; `None` means the credential is missing.
     pub api_key: Option<String>,
@@ -294,7 +373,7 @@ impl Tool for SubmitOrders {
         task: &TaskRecord,
         args: &Self::Args,
     ) -> Result<Self::Facts, GateError> {
-        load_portfolio_facts(&self.store, task, Some(&args.draft_id)).await
+        load_portfolio_facts(&self.store, &self.market, task, Some(&args.draft_id)).await
     }
 
     fn check(
@@ -303,7 +382,7 @@ impl Tool for SubmitOrders {
         task: &TaskRecord,
         facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
-        check_portfolio(args, task, facts)?;
+        check_portfolio(args, task, facts, &self.committee)?;
         if args.portfolio_capital_cents.is_none_or(|c| c.cents() <= 0) {
             return Err(PreDispatchError::InvalidArguments(
                 "missing_or_non_positive_portfolio_capital".into(),

@@ -433,6 +433,22 @@ impl Store {
         Ok(())
     }
 
+    /// Append a line to the task's session log, such as the model's reply or what it was
+    /// told back. `turn` counts it as one of the task's turns.
+    pub async fn note(
+        &self,
+        task_id: &TaskId,
+        kind: &str,
+        actor: &str,
+        detail: &str,
+        turn: bool,
+    ) -> Result<(), GateError> {
+        let change = Change::new(kind, actor, detail);
+        self.record(task_id, change, crate::Fact::Noted { turn })
+            .await
+            .map(drop)
+    }
+
     pub async fn events(&self, task_id: &TaskId) -> Result<Vec<TaskEvent>, GateError> {
         sqlx::query_as::<_, TaskEvent>("SELECT * FROM task_events WHERE task_id = $1 ORDER BY seq")
             .bind(task_id.as_str())

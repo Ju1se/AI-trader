@@ -13,7 +13,7 @@ use trade_core::{
     ApprovalStatus, AsOfDate, Completeness, DeliveryManifest, GateError, HandoffPackage,
     IdempotencyKey, PitMarketSource, PitSecuritySnapshot, PortfolioActionPayload, PreDispatchError,
     RiskTier, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction,
-    TransitionError, UsdCents, WaitMetadata, WeightBps, sha256_hex,
+    TransitionError, UsdCents, WaitMetadata, sha256_hex,
 };
 use trade_gate::{DispatchResult, GateOutcome, GateRequest, run};
 use trade_quant::{QuantSecurityResult, score_pit_universe};
@@ -22,8 +22,9 @@ use trade_research::{
 };
 use trade_store::{CostEntry, MemoryItem, Store};
 
+use crate::agent::AgentModel;
 use crate::config::Strategy;
-use crate::tools::{CreateDraft, DRAFT_TOOL, ORDER_TOOL, SubmitOrders};
+use crate::tools::{CreateDraft, DRAFT_TOOL, ORDER_TOOL, SubmitOrders, limit_breaches};
 
 /// The task type this harness runs.
 pub const REBALANCE: &str = "value_committee_rebalance";
@@ -111,6 +112,8 @@ pub struct Harness {
     pub task_type: TaskTypeConfig,
     /// The broker credential, held here and never given to workers or models.
     pub broker_api_key: Option<String>,
+    /// The model that proposes each action. Without one, ACT follows fixed rules.
+    pub agent: Option<AgentModel>,
 }
 
 fn not_found(what: &str, id: &str) -> GateError {
@@ -175,18 +178,23 @@ impl Harness {
             strategy,
             task_type,
             broker_api_key,
+            agent: None,
         })
     }
 
     pub fn draft_tool(&self) -> CreateDraft {
         CreateDraft {
             store: self.store.clone(),
+            market: self.market.clone(),
+            committee: self.strategy.committee.clone(),
         }
     }
 
     pub fn order_tool(&self) -> SubmitOrders {
         SubmitOrders {
             store: self.store.clone(),
+            market: self.market.clone(),
+            committee: self.strategy.committee.clone(),
             broker: self.broker.clone(),
             api_key: self.broker_api_key.clone(),
         }
@@ -199,14 +207,20 @@ impl Harness {
             .ok_or_else(|| not_found("task", task_id))
     }
 
-    async fn contract(&self, task_id: &TaskId) -> Result<TaskContract, GateError> {
+    /// Let `agent` propose every action from now on.
+    pub fn with_agent(mut self, agent: AgentModel) -> Self {
+        self.agent = Some(agent);
+        self
+    }
+
+    pub(crate) async fn contract(&self, task_id: &TaskId) -> Result<TaskContract, GateError> {
         self.store
             .contract(task_id)
             .await?
             .ok_or_else(|| not_found("contract", task_id))
     }
 
-    async fn config_of(&self, task: &TaskRecord) -> Result<TaskTypeConfig, GateError> {
+    pub(crate) async fn config_of(&self, task: &TaskRecord) -> Result<TaskTypeConfig, GateError> {
         self.store
             .task_type(&task.task_type, &task.config_version)
             .await?
@@ -317,7 +331,10 @@ impl Harness {
         for _ in 0..MAX_ROUNDS {
             let task = self.task(task_id).await?;
             let step = match task.state() {
-                TaskState::Running => self.act(task).await?,
+                TaskState::Running => match &self.agent {
+                    Some(agent) => self.act_with_model(task, agent).await?,
+                    None => self.act(task).await?,
+                },
                 TaskState::LimitReached { .. } => self.close(task).await?,
                 TaskState::OutcomeUnknown { .. } => {
                     if self.reconcile(task_id).await? {
@@ -418,7 +435,7 @@ impl Harness {
 
     /// The quant screen on the contract's date: what was public then, scored. Pure and
     /// free, so it is recomputed rather than stored.
-    fn screen(
+    pub(crate) fn screen(
         &self,
         contract: &TaskContract,
     ) -> Result<(Vec<PitSecuritySnapshot>, Vec<QuantSecurityResult>), GateError> {
@@ -433,7 +450,7 @@ impl Harness {
     /// RETRIEVE, DELEGATE and the committee: the specialists examine the best candidates
     /// (plus the audited ones) through a read-only view, and the committee's results are
     /// stored before any write tool may run.
-    async fn research(
+    pub(crate) async fn research(
         &self,
         task: &mut TaskRecord,
         contract: &TaskContract,
@@ -520,7 +537,7 @@ impl Harness {
     /// VERIFY from stored facts only, then DELIVER, rework, or hand off. From
     /// LIMIT_REACHED, what was finished is verified and delivered as partial. `None` means
     /// rework: the loop goes round again.
-    async fn close(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
+    pub(crate) async fn close(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
         let from_limit = match task.state() {
             TaskState::LimitReached { reason } => Some(reason.clone()),
             _ => None,
@@ -657,7 +674,11 @@ impl Harness {
                         Some(false) => {}
                     }
                 }
-                self.check_limits(&mut check, &draft.weights, contract)?;
+                let (universe, _) = self.screen(contract)?;
+                let committee = &self.strategy.committee;
+                for breach in limit_breaches(&draft.weights, &universe, committee, contract) {
+                    check.fail(CONSTRAINTS, breach);
+                }
             }
         }
 
@@ -686,49 +707,6 @@ impl Harness {
             }
         }
         Ok(check)
-    }
-
-    /// Total, single-position, industry and liquidity limits, using the market data of the
-    /// as-of date rather than anything the committee reported.
-    fn check_limits(
-        &self,
-        check: &mut Verification,
-        weights: &BTreeMap<String, WeightBps>,
-        contract: &TaskContract,
-    ) -> Result<(), GateError> {
-        let committee = &self.strategy.committee;
-        let (snapshots, _) = self.screen(contract)?;
-        let row: BTreeMap<&str, &PitSecuritySnapshot> =
-            snapshots.iter().map(|s| (s.ticker.as_str(), s)).collect();
-        let total: u32 = weights.values().map(|w| u32::from(w.bps())).sum();
-        if total > 10_000 {
-            check.fail(CONSTRAINTS, "total_weight_exceeds_10000_bps");
-        }
-        let capital = contract.portfolio_capital.to_dollars().max(1.0);
-        let mut by_industry: BTreeMap<&str, u32> = BTreeMap::new();
-        for (ticker, weight) in weights {
-            let Some(s) = row.get(ticker.as_str()) else {
-                check.fail(CONSTRAINTS, format!("not_in_universe:{ticker}"));
-                continue;
-            };
-            if weight.bps() > committee.max_single_weight.bps() {
-                check.fail(CONSTRAINTS, format!("single_weight_exceeded:{ticker}"));
-            }
-            let adv_cap = WeightBps::from_ratio_clamped(
-                committee.max_adv_participation * s.adv_usd / capital,
-            );
-            // One basis point of slack for rounding.
-            if weight.bps() > adv_cap.bps().saturating_add(1) {
-                check.fail(CONSTRAINTS, format!("adv_cap_exceeded:{ticker}"));
-            }
-            *by_industry.entry(s.industry.as_str()).or_default() += u32::from(weight.bps());
-        }
-        for (industry, bps) in by_industry {
-            if bps > u32::from(committee.max_industry_weight.bps()) {
-                check.fail(CONSTRAINTS, format!("industry_weight_exceeded:{industry}"));
-            }
-        }
-        Ok(())
     }
 
     // ---- People: approvals, settlement, hand-offs ----------------------------------------

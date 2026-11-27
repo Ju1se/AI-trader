@@ -26,3 +26,5 @@ axum = "0.8"
 futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
+# Plain HTTP for a model next to the server; add "rustls-tls" for hosted HTTPS endpoints.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

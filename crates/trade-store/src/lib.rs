@@ -138,6 +138,8 @@ enum Fact<'a> {
         cost_id: &'a str,
         cost: &'a CostEntry,
     },
+    /// A line of the session log, such as the agent's transcript. `turn` counts one turn.
+    Noted { turn: bool },
     /// How a dispatched action ended.
     Finished {
         key: &'a IdempotencyKey,
@@ -156,6 +158,11 @@ impl Fact<'_> {
             Fact::Denied => {
                 task.turns_used += 1;
                 task.consecutive_denials += 1;
+            }
+            Fact::Noted { turn } => {
+                if turn {
+                    task.turns_used += 1;
+                }
             }
             Fact::Cost { cost_id, cost } => {
                 results::insert_cost_in(conn, &task.task_id, cost_id, cost, now).await?;
