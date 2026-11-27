@@ -9,7 +9,9 @@ use trade_core::{
 };
 use trade_gate::VerifiedGateTicket;
 
-use crate::{Change, Store, db, from_json, new_id, to_json};
+use sqlx::AnyConnection;
+
+use crate::{Change, Fact, Store, db, from_json, new_id, to_json};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredDraft {
@@ -75,6 +77,32 @@ pub struct MemoryItem {
     /// `pending_review` until a person approves or rejects it.
     pub status: String,
     pub reviewed_by: Option<String>,
+}
+
+pub(crate) async fn insert_cost_in(
+    conn: &mut AnyConnection,
+    task_id: &TaskId,
+    cost_id: &str,
+    cost: &CostEntry,
+    now: i64,
+) -> Result<(), GateError> {
+    sqlx::query(
+        "INSERT INTO costs (cost_id, task_id, stage, category, amount_cents, human_minutes,
+             note, created_epoch_s)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(cost_id)
+    .bind(task_id.as_str())
+    .bind(&cost.stage)
+    .bind(&cost.category)
+    .bind(cost.amount.cents())
+    .bind(cost.human_minutes)
+    .bind(&cost.note)
+    .bind(now)
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
+    Ok(())
 }
 
 /// States in which the agent's work on a task has ended. Costs count from here on.
@@ -175,28 +203,11 @@ impl Store {
     pub async fn record_cost(&self, task_id: &TaskId, cost: &CostEntry) -> Result<(), GateError> {
         let cost_id = new_id("COST");
         let change = Change::new("cost", "workflow", &cost.category).about(&cost_id);
-        self.record(task_id, change, async |conn, task, now| {
-            sqlx::query(
-                "INSERT INTO costs (cost_id, task_id, stage, category, amount_cents,
-                     human_minutes, note, created_epoch_s)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-            )
-            .bind(&cost_id)
-            .bind(task_id.as_str())
-            .bind(&cost.stage)
-            .bind(&cost.category)
-            .bind(cost.amount.cents())
-            .bind(cost.human_minutes)
-            .bind(&cost.note)
-            .bind(now)
-            .execute(&mut *conn)
-            .await
-            .map_err(db)?;
-            task.spend = UsdCents::from_cents(task.spend.cents() + cost.amount.cents());
-            Ok(())
-        })
-        .await
-        .map(drop)
+        let fact = Fact::Cost {
+            cost_id: &cost_id,
+            cost,
+        };
+        self.record(task_id, change, fact).await.map(drop)
     }
 
     /// Diagram 6 CALCULATE. Only ended tasks count: their whole cost goes in the

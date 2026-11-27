@@ -59,7 +59,7 @@ async fn ambiguous_request_waits_for_an_answer_then_goes_to_a_person() {
     let (silent, _) = h.admit(&common::intake("silent")).await.unwrap();
     h.frame(&silent.task_id, &vague).await.unwrap();
     h.store.advance_clock(waits.input_ttl_s + 1);
-    assert_eq!(h.sweep().await.unwrap(), 1);
+    assert_eq!(h.sweep().await.unwrap().len(), 1);
     let handed = h.task(&silent.task_id).await.unwrap();
     assert_eq!(
         handed.state().wait_meta().unwrap().owner_id,
@@ -169,7 +169,7 @@ async fn an_approval_that_times_out_counts_as_refused() {
         panic!("expected an approval request");
     };
     h.store.advance_clock(h.task_type.waits.approval_ttl_s + 1);
-    assert_eq!(h.sweep().await.unwrap(), 1);
+    assert_eq!(h.sweep().await.unwrap().len(), 1);
     let approval = h.store.approval(&approval_id).await.unwrap().unwrap();
     assert_eq!(approval.status, ApprovalStatus::Expired);
     assert_eq!(state(&h.task(&task).await.unwrap()), "DECLINED");
@@ -181,7 +181,7 @@ async fn an_undisputed_delivery_completes_when_the_window_closes() {
     let h = common::harness().await;
     let (task, _) = common::delivered(&h).await;
     h.store.advance_clock(h.task_type.waits.settle_window_s + 1);
-    assert_eq!(h.sweep().await.unwrap(), 1);
+    assert_eq!(h.sweep().await.unwrap().len(), 1);
     assert_eq!(state(&h.task(&task).await.unwrap()), "COMPLETED");
 }
 

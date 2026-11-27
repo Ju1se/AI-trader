@@ -4,12 +4,12 @@ use sqlx::AnyConnection;
 use sqlx::FromRow;
 use trade_core::{
     ActionIntentRecord, ActionIntentStatus, ApprovalId, ApprovalRecord, ApprovalStatus, GateError,
-    IdempotencyKey, PreDispatchError, TaskId, TaskRecord, TaskState,
+    IdempotencyKey, PreDispatchError, TaskId, TaskRecord,
 };
 use trade_gate::{DispatchResult, GateContext, GateLedger, NewApproval};
 
 use crate::tasks::{UNSETTLED, save_in, task_in, task_type_in, unsettled_action_in};
-use crate::{Change, Store, db, new_id, not_found};
+use crate::{Change, Fact, Store, db, new_id, not_found};
 
 #[derive(FromRow)]
 struct ApprovalRow {
@@ -109,7 +109,7 @@ fn actions_from(rows: Vec<ActionRow>) -> Result<Vec<ActionIntentRecord>, GateErr
 
 /// Record how a sent action ended, if it is still in one of the `from` statuses. An action
 /// that never left gives back the approval it used, since that approval was not spent.
-async fn settle_action_in(
+pub(crate) async fn settle_action_in(
     conn: &mut AnyConnection,
     key: &IdempotencyKey,
     result: &DispatchResult,
@@ -205,13 +205,7 @@ impl GateLedger for Store {
     ) -> Result<(), GateError> {
         let code = reason.code();
         let change = Change::new("denied", "gate", &code);
-        self.record(task_id, change, async |_, task, _| {
-            task.turns_used += 1;
-            task.consecutive_denials += 1;
-            Ok(())
-        })
-        .await
-        .map(drop)
+        self.record(task_id, change, Fact::Denied).await.map(drop)
     }
 
     async fn request_approval(
@@ -315,26 +309,8 @@ impl GateLedger for Store {
         result: &DispatchResult,
     ) -> Result<(), GateError> {
         let change = Change::new("action_finished", "gate", result_name(result)).about(key);
-        self.record(task_id, change, async |conn, task, now| {
-            settle_action_in(conn, key, result, "('DISPATCHED')", now).await?;
-            match result {
-                DispatchResult::Verified { .. } => task.consecutive_denials = 0,
-                DispatchResult::NotSent { .. } => {}
-                DispatchResult::Unknown { .. } => {
-                    let frozen = TaskState::OutcomeUnknown {
-                        frozen_action_key: key.clone(),
-                    };
-                    // Normally RUNNING. If a person took the task over meanwhile, it stays
-                    // with them; the unsettled action still blocks every other action.
-                    if task.state().can_transition(&frozen) {
-                        task.transition(frozen, now)?;
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map(drop)
+        let fact = Fact::Finished { key, result };
+        self.record(task_id, change, fact).await.map(drop)
     }
 }
 

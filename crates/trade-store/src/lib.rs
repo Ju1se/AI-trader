@@ -21,7 +21,8 @@ use serde::de::DeserializeOwned;
 use sqlx::AnyConnection;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{Any, AnyPool, Transaction};
-use trade_core::{GateError, TaskId, TaskRecord, sha256_hex};
+use trade_core::{GateError, IdempotencyKey, TaskId, TaskRecord, TaskState, UsdCents, sha256_hex};
+use trade_gate::DispatchResult;
 
 pub use results::{CostEntry, MemoryItem, StoredDraft, UnitEconomics};
 pub use tasks::TaskEvent;
@@ -97,26 +98,22 @@ impl Store {
         self.pool.begin().await.map_err(db)
     }
 
-    /// Read the task, let `apply` change it and write related rows in the same
-    /// transaction, then save it. Retried after a version conflict, so use it only to
-    /// record facts that hold whatever else happened (a denial, a cost, an action's
-    /// result), never to make a decision from a stale read.
-    async fn record<F>(
+    /// Read the task, apply `fact` to it and to the rows it touches, and save it, in one
+    /// transaction. Retried after a version conflict, which is safe because a fact holds
+    /// whatever else happened; never use this to make a decision from a stale read.
+    async fn record(
         &self,
         task_id: &TaskId,
         change: Change<'_>,
-        mut apply: F,
-    ) -> Result<TaskRecord, GateError>
-    where
-        F: AsyncFnMut(&mut AnyConnection, &mut TaskRecord, i64) -> Result<(), GateError>,
-    {
+        fact: Fact<'_>,
+    ) -> Result<TaskRecord, GateError> {
         for _ in 0..MAX_ATTEMPTS {
             let now = self.now();
             let mut tx = self.begin().await?;
             let mut task = tasks::task_in(&mut tx, task_id)
                 .await?
                 .ok_or_else(|| not_found("task", task_id))?;
-            apply(&mut tx, &mut task, now).await?;
+            fact.apply(&mut tx, &mut task, now).await?;
             match tasks::save_in(&mut tx, &task, &change, now).await {
                 Err(GateError::Conflict(_)) => continue,
                 Err(e) => return Err(e),
@@ -128,6 +125,61 @@ impl Store {
             }
         }
         Err(GateError::Conflict(format!("task {task_id} kept changing")))
+    }
+}
+
+/// Something that happened to a task and must be recorded.
+#[derive(Debug, Clone, Copy)]
+enum Fact<'a> {
+    /// The gate refused a proposal: one turn and one consecutive denial.
+    Denied,
+    /// A cost, added to the task's spend.
+    Cost {
+        cost_id: &'a str,
+        cost: &'a CostEntry,
+    },
+    /// How a dispatched action ended.
+    Finished {
+        key: &'a IdempotencyKey,
+        result: &'a DispatchResult,
+    },
+}
+
+impl Fact<'_> {
+    async fn apply(
+        self,
+        conn: &mut AnyConnection,
+        task: &mut TaskRecord,
+        now: i64,
+    ) -> Result<(), GateError> {
+        match self {
+            Fact::Denied => {
+                task.turns_used += 1;
+                task.consecutive_denials += 1;
+            }
+            Fact::Cost { cost_id, cost } => {
+                results::insert_cost_in(conn, &task.task_id, cost_id, cost, now).await?;
+                task.spend = UsdCents::from_cents(task.spend.cents() + cost.amount.cents());
+            }
+            Fact::Finished { key, result } => {
+                ledger::settle_action_in(conn, key, result, "('DISPATCHED')", now).await?;
+                match result {
+                    DispatchResult::Verified { .. } => task.consecutive_denials = 0,
+                    DispatchResult::NotSent { .. } => {}
+                    DispatchResult::Unknown { .. } => {
+                        let frozen = TaskState::OutcomeUnknown {
+                            frozen_action_key: key.clone(),
+                        };
+                        // Normally RUNNING. If a person took the task over meanwhile, it
+                        // stays with them; the unsettled action still blocks other actions.
+                        if task.state().can_transition(&frozen) {
+                            task.transition(frozen, now)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

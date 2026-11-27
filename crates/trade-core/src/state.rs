@@ -179,6 +179,47 @@ impl TaskState {
         })
     }
 
+    /// One example of every state, in Diagram 4a order.
+    fn examples() -> [Self; 13] {
+        let wait = WaitMetadata {
+            owner_id: "-".into(),
+            deadline_epoch_s: 1,
+            timeout_action: TimeoutAction::HandOff,
+        };
+        let reason = String::new;
+        [
+            Self::Queued,
+            Self::Running,
+            Self::AwaitingInput(wait.clone()),
+            Self::AwaitingApproval(wait.clone()),
+            Self::OutcomeUnknown {
+                frozen_action_key: IdempotencyKey::new("-"),
+            },
+            Self::LimitReached { reason: reason() },
+            Self::Verifying,
+            Self::Settling(wait.clone()),
+            Self::Completed,
+            Self::Failed { reason: reason() },
+            Self::HandedOff(wait),
+            Self::Declined { reason: reason() },
+            Self::Cancelled { reason: reason() },
+        ]
+    }
+
+    /// Codes of every state, in Diagram 4a order.
+    pub fn all_codes() -> [&'static str; 13] {
+        Self::examples().map(|s| s.code())
+    }
+
+    /// The states this one may move to, by code.
+    pub fn next_codes(&self) -> Vec<&'static str> {
+        Self::examples()
+            .iter()
+            .filter(|next| self.can_transition(next))
+            .map(Self::code)
+            .collect()
+    }
+
     /// The legal moves of Diagram 4a, row by row. Anything not listed is illegal.
     pub fn can_transition(&self, next: &Self) -> bool {
         use TaskState as S;
@@ -391,33 +432,8 @@ mod tests {
 
     use super::*;
 
-    fn wait() -> WaitMetadata {
-        WaitMetadata::new("owner", 1, TimeoutAction::HandOff).unwrap()
-    }
-
-    fn reason() -> String {
-        "r".into()
-    }
-
-    /// One example of every state, in Diagram 4a order.
     fn all_states() -> Vec<TaskState> {
-        vec![
-            TaskState::Queued,
-            TaskState::Running,
-            TaskState::AwaitingInput(wait()),
-            TaskState::AwaitingApproval(wait()),
-            TaskState::OutcomeUnknown {
-                frozen_action_key: IdempotencyKey::new("k"),
-            },
-            TaskState::LimitReached { reason: reason() },
-            TaskState::Verifying,
-            TaskState::Settling(wait()),
-            TaskState::Completed,
-            TaskState::Failed { reason: reason() },
-            TaskState::HandedOff(wait()),
-            TaskState::Declined { reason: reason() },
-            TaskState::Cancelled { reason: reason() },
-        ]
+        TaskState::examples().to_vec()
     }
 
     /// Diagram 4a written out edge by edge, independent of `can_transition`.

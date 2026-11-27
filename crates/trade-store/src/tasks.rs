@@ -1,5 +1,7 @@
 //! Task types, tasks and their event log, contracts, waits, deliveries and hand-offs.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use sqlx::AnyConnection;
 use sqlx::FromRow;
@@ -365,16 +367,54 @@ impl Store {
         task_in(&mut conn, task_id).await
     }
 
-    /// The most recent tasks first.
-    pub async fn tasks(&self, limit: i64) -> Result<Vec<TaskRecord>, GateError> {
-        let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT * FROM tasks ORDER BY created_epoch_s DESC, task_id LIMIT $1",
-        )
+    /// One page of tasks, newest first, optionally only those in `state` or from
+    /// `requester`, and how many match in all.
+    pub async fn task_page(
+        &self,
+        state: Option<&str>,
+        requester: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<TaskRecord>, i64), GateError> {
+        let filter = "($1 IS NULL OR state_code = $1) AND ($2 IS NULL OR requester_id = $2)";
+        let rows = sqlx::query_as::<_, TaskRow>(&format!(
+            "SELECT * FROM tasks WHERE {filter}
+             ORDER BY created_epoch_s DESC, task_id LIMIT $3 OFFSET $4"
+        ))
+        .bind(state)
+        .bind(requester)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .map_err(db)?;
-        tasks_from(rows)
+        let total = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT CAST(COUNT(*) AS BIGINT) FROM tasks WHERE {filter}"
+        ))
+        .bind(state)
+        .bind(requester)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok((tasks_from(rows)?, total))
+    }
+
+    /// How many tasks are in each state, and approvals in each status.
+    pub async fn status_counts(
+        &self,
+    ) -> Result<(BTreeMap<String, i64>, BTreeMap<String, i64>), GateError> {
+        let mut counts = Vec::new();
+        for (table, column) in [("tasks", "state_code"), ("approvals", "status")] {
+            let sql =
+                format!("SELECT {column}, CAST(COUNT(*) AS BIGINT) FROM {table} GROUP BY {column}");
+            let rows = sqlx::query_as::<_, (String, i64)>(&sql)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db)?;
+            counts.push(rows.into_iter().collect::<BTreeMap<_, _>>());
+        }
+        let approvals = counts.pop().unwrap_or_default();
+        Ok((counts.pop().unwrap_or_default(), approvals))
     }
 
     /// Save `task` if nobody changed it since it was read. On success `task` carries the

@@ -324,6 +324,7 @@ impl PortfolioActionPayload {
 
 /// DB-managed approval lifecycle status (`PENDING -> APPROVED | REJECTED -> CONSUMED | EXPIRED`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ApprovalStatus {
     Pending,
     Approved,
@@ -375,6 +376,7 @@ pub struct ApprovalRecord {
 
 /// Diagram 3b / Requirement #3: Action status includes `Dispatched`, and rejects unknown strings!
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ActionIntentStatus {
     Planned,
     Dispatched,
@@ -423,6 +425,7 @@ pub struct ActionIntentRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Completeness {
     Complete,
     Partial,

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
-//! Command line: `trade <demo|backtest|research|bench> [--db URL] [--as-of DATE] [--root DIR]`.
-//! The numbers match the Python MVP (`v0.1-python-mvp`) item by item.
+//! Command line: `trade <serve|demo|backtest|research|bench> [--db URL] [--root DIR]
+//! [--as-of DATE] [--addr HOST:PORT] [--dev]`. The numbers match the Python MVP
+//! (`v0.1-python-mvp`) item by item.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -9,13 +10,15 @@ use std::time::Instant;
 
 use trade_core::{ActionIntentStatus, AsOfDate, PitMarketSource, TaskId};
 use trade_quant::{audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe};
-use trade_server::{FrameRequest, Framing, Harness, Intake, ORDER_TOOL, Step};
+use trade_server::{App, FrameRequest, Framing, Harness, Intake, ORDER_TOOL, Step};
 
 struct Args {
     command: String,
     db: String,
     as_of: String,
     root: PathBuf,
+    addr: String,
+    dev: bool,
 }
 
 fn parse_args() -> Args {
@@ -25,6 +28,8 @@ fn parse_args() -> Args {
         db: ":memory:".into(),
         as_of: "2026-02-10".into(),
         root: PathBuf::new(),
+        addr: "127.0.0.1:8000".into(),
+        dev: std::env::var("AITRADER_ENABLE_DEV_ENDPOINTS").is_ok_and(|v| v == "true"),
     };
     let mut root = None;
     let mut first = true;
@@ -33,6 +38,8 @@ fn parse_args() -> Args {
             "--db" => parsed.db = args.next().unwrap_or_default(),
             "--as-of" => parsed.as_of = args.next().unwrap_or_default(),
             "--root" => root = args.next().map(PathBuf::from),
+            "--addr" => parsed.addr = args.next().unwrap_or_default(),
+            "--dev" => parsed.dev = true,
             command if first => parsed.command = command.into(),
             _ => {}
         }
@@ -287,9 +294,44 @@ async fn demo(h: &Harness) -> Result<(), String> {
     Ok(())
 }
 
+/// The HTTP API, with the deadline sweeper running every 30 seconds.
+async fn serve(h: Harness, args: &Args) -> Result<(), String> {
+    let origins: Vec<String> = std::env::var("AITRADER_CORS_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000".into())
+        .split(',')
+        .map(|o| o.trim().to_string())
+        .collect();
+    let app = App::new(h, args.dev);
+    let sweeper = app.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            every.tick().await;
+            if let Err(e) = sweeper.sweep().await {
+                eprintln!("sweep failed: {e}");
+            }
+        }
+    });
+    let listener = tokio::net::TcpListener::bind(&args.addr)
+        .await
+        .map_err(err)?;
+    println!(
+        "listening on http://{} (database: {}, dev endpoints: {})",
+        args.addr,
+        args.db,
+        if args.dev { "on" } else { "off" }
+    );
+    axum::serve(listener, app.router(&origins))
+        .await
+        .map_err(err)
+}
+
 async fn run() -> Result<(), String> {
     let args = parse_args();
     let h = Harness::open(&args.root, &args.db).await?;
+    if args.command == "serve" {
+        return serve(h, &args).await;
+    }
     let s = &h.strategy;
     match args.command.as_str() {
         "demo" => demo(&h).await,
@@ -335,7 +377,7 @@ async fn run() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "unknown command {other:?}; usage: trade <demo|backtest|research|bench> [--db URL] [--as-of DATE] [--root DIR]"
+            "unknown command {other:?}; usage: trade <serve|demo|backtest|research|bench> [--db URL] [--root DIR] [--as-of DATE] [--addr HOST:PORT] [--dev]"
         )),
     }
 }

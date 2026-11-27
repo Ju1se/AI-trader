@@ -982,8 +982,8 @@ impl Harness {
     /// Act on every wait whose deadline has passed. A timeout is never a silent approval:
     /// an unanswered question goes to a person, an unanswered approval counts as refused,
     /// an undisputed delivery completes, and an unclaimed hand-off goes to the next owner.
-    /// Returns how many waits were handled.
-    pub async fn sweep(&self) -> Result<usize, GateError> {
+    /// Returns the tasks it handled.
+    pub async fn sweep(&self) -> Result<Vec<TaskId>, GateError> {
         let due = self.store.due_waits(self.store.now()).await?;
         for task in &due {
             match self.expire(task.clone()).await {
@@ -992,7 +992,7 @@ impl Harness {
                 Err(e) => return Err(e),
             }
         }
-        Ok(due.len())
+        Ok(due.into_iter().map(|t| t.task_id).collect())
     }
 
     async fn expire(&self, mut task: TaskRecord) -> Result<(), GateError> {
