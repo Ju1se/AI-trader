@@ -23,7 +23,7 @@
 | `fixtures/market.json` | 演示和测试用的时点数据 |
 | `prompts/agent.md` | 给模型的说明:可用的工具和规则。改了不用重新编译 |
 | `migrations/` | 数据库结构 |
-| `notebooks/colab.ipynb` | 在 Google Colab 上用本地模型跑全程的笔记本 |
+| `notebooks/` | Colab 笔记本 `colab.ipynb`;`yfinance_market.py` 整理真实数据;`scenarios.py` 跑失败场景 |
 
 ## 常用命令
 
@@ -68,6 +68,15 @@ cargo run -p trade-server --bin trade -- backtest --root /tmp/yf
 ```
 
 缺的科目和用到的假设写在 `/tmp/yf/run.json` 里。
+
+## 失败场景
+
+`notebooks/scenarios.py` 通过接口跑一个成功案例和十个对抗案例:人否决、批准过期、违反规则的要求、资料里的提示注入、请求不完整、券商出错。每个场景按系统状态判定,并统计被拒、人否决、改正的次数和每个完成任务的成本。要在一个刚启动的服务上跑,先固定规则,再接模型,两边比较:
+
+```bash
+cargo run -p trade-server --bin trade -- serve --dev
+python3 notebooks/scenarios.py
+```
 
 ## 用 PostgreSQL
 
