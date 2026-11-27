@@ -1,69 +1,65 @@
-# Trade AI — Pure Rust Agent 1–7 Governed Multi-Agent Value Investing System
+# AI-trader
 
-A 100% safe-Rust (`#![forbid(unsafe_code)]` across all workspace crates) quantitative value investing research, governance, and paper-execution system implementing `Agent 1`–`Agent 7` (Diagrams 3a, 3b, 4a, 4b), `资料/deep-research-report.md`, and `资料/8 Common Backtesting Pitfalls Exercise.pdf`.
+价值投资研究和模拟盘执行的 Agent 系统。后端只用 Rust,只连模拟券商,不做真实交易。
 
-## Cargo Workspace Crate Isolation
+- 设计来源:7 张导图,在 [`docs/导图/`](docs/导图/);参考资料在 [`docs/资料/`](docs/资料/)。
+- 软件工程图:[`docs/diagrams.md`](docs/diagrams.md),11 张图,编号沿用导图。
+- Rust 后端的写法、改进清单和进度:[`docs/rust-architecture.md`](docs/rust-architecture.md)。
+- 前端联调:[`docs/api.md`](docs/api.md)。数据库:[`docs/database.md`](docs/database.md)。
 
-```text
-                       ┌──────────────────┐
-                       │    trade-core    │  sha2, serde, serde_json
-                       │ 13 States (4a),  │  Private state + transition()
-                       │ R0-R4 Tiers (3a),│  PreDispatch vs PostDispatchUnknown
-                       │ PIT Date Types   │
-                       └────────┬─────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┬───────────────────┐
-        ▼                       ▼                       ▼                   ▼
-┌───────────────┐       ┌───────────────┐       ┌───────────────┐   ┌───────────────┐
-│  trade-quant  │       │  trade-gate   │       │  trade-store  │   │ trade-broker  │
-│ 15 Factors &  │       │ ONLY depends  │       │ ONLY crate w/ │   │ Standalone    │
-│ PIT Backtest  │       │ on trade-core!│       │ sqlx! SQLite &│   │ PaperBroker   │
-└───────┬───────┘       │ Generic Tool  │       │ PostgreSQL +  │   │ Adapter       │
-        │               │ & GateLedger  │       │ migrations/   │   └───────┬───────┘
-        ▼               └───────┬───────┘       └───────┬───────┘           │
-┌───────────────┐               │                       │                   │
-│ trade-workers │               │                       │                   │
-│ Read-Only     │               │                       │                   │
-│ Workers +     │               │                       │                   │
-│ Committee     │               │                       │                   │
-└───────┬───────┘               │                       │                   │
-        └───────────────────────┴───────────┬───────────┴───────────────────┘
-                                            ▼
-                                    ┌───────────────┐
-                                    │   trade-cli   │
-                                    │ Tool Impls,   │
-                                    │ DB Verifier,  │
-                                    │ CLI & Parity  │
-                                    └───────────────┘
-```
+## 目录
 
-## Key Architectural Guarantees
+| 路径 | 内容 |
+|---|---|
+| `crates/trade-core` | 类型、ID、任务状态机(图 4a)、风险分级、合约、错误类型。无 IO |
+| `crates/trade-quant` | 因子打分和否决、时点回测。无 IO |
+| `crates/trade-research` | 三个专家和投资委员会。无 IO |
+| `crates/trade-gate` | 闸门:纯函数 `decide`(图 3a)和执行顺序 `run`。只定义接口,无 IO |
+| `crates/trade-store` | 唯一访问数据库的地方。SQLite 和 PostgreSQL 共用一套 SQL |
+| `crates/trade-adapters` | 外部系统:时点行情(读 `fixtures/`)和模拟券商 |
+| `crates/trade-server` | 用例(图 0)、两个受控工具、`/v1` 接口和事件流、命令行 |
+| `config/strategy.toml` | 策略参数:因子权重和阈值、委员会、仓位上限、回测。改了不用重新编译 |
+| `config/task_types/` | 任务类型配置:工具的风险分级、上限、放权级别、等待期限 |
+| `fixtures/market.json` | 演示和测试用的时点数据 |
+| `migrations/` | 数据库结构 |
 
-1. **Physical Crate Isolation**:
-   - `trade-store` is the **only** crate depending on `sqlx`, managing schema via portable ANSI SQL in [migrations/](migrations/) (seamless switch between `sqlite://` and `postgres://`).
-   - `trade-gate` depends **only** on `trade-core` and invokes tools through the generic `Tool` trait (zero hardcoded tool names).
-   - `trade-workers` hosts read-only specialist workers and `InvestmentCommittee` with zero database or broker dependencies.
-   - `trade-broker` provides an independent `PaperBrokerAdapter` decoupled from the storage layer.
-2. **Diagram 4a State Machine & Optimistic Concurrency**:
-   - Exact 13 states: `QUEUED`, `RUNNING`, `AWAITING_INPUT`, `AWAITING_APPROVAL`, `OUTCOME_UNKNOWN`, `LIMIT_REACHED`, `VERIFYING`, `SETTLING`, `COMPLETED`, `FAILED`, `HANDED_OFF`, `DECLINED`, `CANCELLED`.
-   - `TaskRecord.state` is private and only mutable via `TaskRecord::transition()`, persisted with `version` optimistic locking.
-3. **Diagram 3a & 3b Gate & Approval Rules**:
-   - Unconfigured tools are immediately rejected; `R4` is permanently prohibited; order submission is `R3`; draft creation is `R2`.
-   - Approvals live exclusively in the database (`PENDING -> APPROVED | REJECTED -> CONSUMED` in a single transaction with `DISPATCHED` intent registration).
-   - Authoritative veto lists and verification inputs are read directly from `DbStore` & `PaperBrokerAdapter`, never accepted from callers.
-   - Algebraic `GateError` separates `PreDispatch` rejections from `PostDispatchUnknown` errors, unconditionally freezing tasks in `OUTCOME_UNKNOWN` upon any post-dispatch failure.
-
-## Quickstart
+## 常用命令
 
 ```bash
-# Run all unit and integration tests across all 6 crates
-cargo test --workspace --offline
+# 全部测试:单元、属性测试、和 Python 版的逐项比对、端到端、HTTP 接口
+cargo test --workspace
 
-# Run end-to-end demo (item-by-item parity with v0.1-python-mvp)
-cargo run --offline -p trade-cli -- demo
+# 演示:回测和各期打分,然后一个任务从受理走到结案,经过两次人工批准
+cargo run -p trade-server --bin trade -- demo
 
-# Standalone backtest, single-date research, and Rust throughput benchmark
-cargo run --offline -p trade-cli -- backtest
-cargo run --offline -p trade-cli -- research --as-of 2026-02-10
-cargo run --release --offline -p trade-cli -- bench
+# 单独跑回测、单日研究、打分速度
+cargo run -p trade-server --bin trade -- backtest
+cargo run -p trade-server --bin trade -- research --as-of 2026-02-10
+cargo run --release -p trade-server --bin trade -- bench
+
+# 启动接口,带联调接口,数据存在 trade.db
+cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 ```
+
+接口默认在 `http://127.0.0.1:8000`,改用 `--addr`。不给 `--db` 时用内存数据库,进程退出数据就没了。
+
+## 用 PostgreSQL
+
+默认用 SQLite。要在 PostgreSQL 上跑,先起本机数据库:
+
+```bash
+docker compose up -d db
+```
+
+然后把连接串交给服务,或者让存储层的测试在 PostgreSQL 上再跑一遍(每个测试建一个新库):
+
+```bash
+cargo run -p trade-server --bin trade -- serve --db postgres://aitrader:aitrader@localhost:5432/aitrader
+TRADE_TEST_PG_URL=postgres://aitrader:aitrader@localhost:5432/postgres cargo test -p trade-store
+```
+
+## 安全约定
+
+- 模型和专家只提议,所有写操作过闸门。没写进任务类型配置的工具直接拒绝,R4 永远拒绝,R3 必须由发起人和配置管理员以外的人批准确切内容,批准只能用一次、会过期。
+- 请求发出后出错,任务冻结为 `OUTCOME_UNKNOWN`,先向券商对账再决定;同一个幂等键不会下第二次单。
+- 券商凭证只在服务里,不交给专家或模型。

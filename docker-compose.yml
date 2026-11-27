@@ -1,7 +1,7 @@
-# 本地开发用的 PostgreSQL。默认用 SQLite 时不需要它。
+# 本机开发用的 PostgreSQL。默认用 SQLite 时不需要它。
 # 启动:docker compose up -d db
-# 然后在 backend/.env 里设置:
-#   AITRADER_DATABASE_URL=postgresql+psycopg://aitrader:aitrader@localhost:5432/aitrader
+# 服务:trade serve --db postgres://aitrader:aitrader@localhost:5432/aitrader
+# 存储层测试:TRADE_TEST_PG_URL=postgres://aitrader:aitrader@localhost:5432/postgres cargo test -p trade-store
 services:
   db:
     image: postgres:16-alpine

@@ -8,14 +8,6 @@
 *.sqlite3
 runtime/
 
-# Python (the backend skeleton until it is removed)
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-.pytest_cache/
-*.egg-info/
-
 # Frontend
 node_modules/
 

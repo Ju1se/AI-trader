@@ -357,6 +357,7 @@ async fn only_the_requester_answers_its_questions() {
     )
     .await;
     assert_eq!(state(&task), "AWAITING_INPUT");
+    assert_eq!(task["open_questions"], json!(["missing_as_of_date"]));
     let path = format!("/v1/tasks/{id}/answer");
     let answer = new_task(Some("2026-02-10"));
     let (status, body) = call(&router, "POST", &path, Some("bob"), Some(answer.clone())).await;

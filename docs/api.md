@@ -1,357 +1,326 @@
 # 接口指南(给前端联调)
 
-后端骨架的 HTTP 接口。Agent 还没接入,任务靠 `/v1/dev` 下的联调接口推进,所以前端现在就能把每个状态、每个页面都跑通。
+Rust 后端的 HTTP 接口,代码在 `crates/trade-server/src/api.rs`。Agent 的每一步都是真实的用例:研究、闸门、批准、下单、对账、验收都会真的发生。联调时用 `/v1/dev` 下的接口载入演示任务、拨快时钟、给模拟券商注入故障,不需要手工改状态。
 
-- 交互式文档:后端启动后打开 `http://localhost:8000/docs`,可以直接在页面上发请求。
-- 机器可读的定义:[`openapi.json`](openapi.json)。可以用它生成前端类型,例如 `npx openapi-typescript docs/openapi.json -o frontend/src/api/schema.d.ts`。
-- 启动后端:见 [`backend/README.md`](../backend/README.md)。
+启动:
+
+```bash
+cargo run -p trade-server --bin trade -- serve --dev --db trade.db
+```
 
 ## 约定
 
 | 项 | 约定 |
 |---|---|
-| 地址 | 开发环境 `http://localhost:8000` |
-| 身份 | 请求头 `X-User-Id: 用户名`。这是开发期的占位,正式登录接入后会换掉。演示数据里发起人是 `alice`,批准人用 `bob` |
+| 地址 | `http://127.0.0.1:8000`,用 `--addr` 改 |
+| 身份 | 请求头 `X-User-Id: 用户名`,开发期的占位,接入正式登录后会换掉。演示数据里发起人是 `alice`,批准人是 `bob`,配置管理员是 `platform_admin` |
 | 格式 | 请求和响应都是 JSON |
-| 时间 | UTC,ISO 8601,带 `Z`,例如 `2026-11-22T09:07:10.113032Z` |
+| 时间 | UTC,ISO 8601,带 `Z`,例如 `2026-11-27T09:07:10Z` |
+| 金额 | 请求里用美元(`portfolio_capital_usd`),`usage.spend_usd` 也是美元;合约和交付清单里原样给出分(`portfolio_capital`、`total_spend`) |
+| 权重 | 基点,`10000` 是 100% |
 | 分页 | 列表接口用 `limit`(1 到 200,默认 50)和 `offset`,返回 `{items, total}` |
-| 跨域 | 默认只允许 `http://localhost:3000`,改 `AITRADER_CORS_ORIGINS` |
+| 跨域 | 默认只允许 `http://localhost:3000`,用环境变量 `AITRADER_CORS_ORIGINS`(逗号分隔)改 |
 
-不需要 `X-User-Id` 的接口:`/health`、`/v1/meta/states`、`/v1/profiles`、`/v1/stream`、`/v1/dev/*`。其余都需要。
+不需要 `X-User-Id` 的接口:`/health`、`/v1/meta/states`、`/v1/task-types`、`/v1/stream`、`/v1/dev/*`。其余都需要。
 
 ## 错误
 
-业务错误统一是这个形状,前端按 `code` 判断,`message` 是给开发者看的英文说明:
+统一是这个形状,前端按 `code` 判断,`message` 是给开发者看的英文说明:
 
 ```json
-{
-  "error": {
-    "code": "self_approval_forbidden",
-    "message": "the requester cannot approve their own task"
-  }
-}
+{"error": {"code": "self_approval_forbidden", "message": "PreDispatch(separation_of_duties:alice)"}}
 ```
 
 | HTTP | `code` | 什么时候出现 |
 |---|---|---|
 | 401 | `missing_identity` | 没带 `X-User-Id` |
-| 403 | `self_approval_forbidden` | 发起人想批准自己的任务 |
-| 403 | `not_requester` | 不是发起人却去回答澄清问题 |
-| 403 | `not_allowed` | 不是发起人或负责人却去取消任务 |
-| 404 | `task_not_found` `profile_not_found` `approval_not_found` | 对象不存在 |
+| 403 | `self_approval_forbidden` | 发起人或配置管理员想批准 |
+| 403 | `not_requester` | 不是发起人却去回答问题 |
+| 403 | `not_allowed` | 不是发起人却去验收、取消、重开;不是接手人却去交回 |
+| 404 | `task_not_found` `approval_not_found` | 对象不存在 |
 | 409 | `invalid_transition` | 当前状态不允许这个操作 |
 | 409 | `state_conflict` | 任务被别人同时改了,重新取详情后再试 |
-| 409 | `unresolved_actions` | 还有结果未知的动作,不能判失败 |
+| 409 | `unresolved_actions` | 还有已发出但结果未定的动作,不能取消或判失败 |
 | 409 | `not_awaiting_input` `not_settling` | 任务不在对应的等待状态 |
 | 409 | `approval_not_pending` | 这条批准已经处理过 |
-| 409 | `approval_expired` | 批准已过期。任务同时被置为 `DECLINED` |
-| 409 | `payload_changed` | 动作内容在请求批准之后变了,原批准作废 |
-| 422 | (无 `code`) | 请求体不合法。这是框架默认格式 `{"detail": [...]}` |
+| 409 | `approval_expired` | 批准已过期,按否决处理,任务同时变化(见「批准」) |
+| 422 | `invalid_request` | 请求体不合法,或字段取值不认识 |
+
+闸门拒绝一个动作不是接口错误,而是 `advance` 的结果之一(`step.kind = "denied"`,见下文)。
 
 ## 任务状态
 
-`GET /v1/meta/states` 返回这张表,前端用它渲染看板的列和状态标签,不要把状态名写死在前端。
+`GET /v1/meta/states` 返回这张表,前端用它渲染看板的列和标签,不要把状态名写死。每个任务还带 `allowed_next_states`,由图 4a 的迁移表算出。
 
 | `state` | `state_label` | `owner_role`:此刻该谁行动 | 前端该给的操作 |
 |---|---|---|---|
 | `QUEUED` | 排队 | operator | 取消 |
-| `RUNNING` | 运行中 | operator | 取消 |
-| `AWAITING_INPUT` | 等回答 | requester | 发起人回答问题 |
+| `RUNNING` | 运行中 | operator | 推进、取消 |
+| `AWAITING_INPUT` | 等回答 | requester | 发起人回答 |
 | `AWAITING_APPROVAL` | 等批准 | approver | 批准人批准或否决 |
-| `OUTCOME_UNKNOWN` | 结果未知 | reconciler | 只读。不能取消 |
-| `LIMIT_REACHED` | 触上限 | owner | 只读(加额度的接口还没做) |
+| `OUTCOME_UNKNOWN` | 结果未知 | reconciler | 推进(会先对账)。不能取消 |
+| `LIMIT_REACHED` | 触上限 | owner | 推进(验收已完成的部分) |
 | `VERIFYING` | 验收中 | verifier | 只读 |
-| `SETTLING` | 待确认 | reviewer | 验收或退回 |
-| `COMPLETED` | 已完成 | 无 | 只读 |
+| `SETTLING` | 待确认 | requester | 发起人验收或退回 |
+| `COMPLETED` | 已完成 | none | 发起人重开 |
 | `FAILED` | 已失败 | owner | 只读 |
-| `HANDED_OFF` | 转人工 | assignee | 只读 |
+| `HANDED_OFF` | 转人工 | assignee | 接手人交回 |
 | `DECLINED` | 被否决 | requester | 只读 |
-| `CANCELLED` | 已取消 | 无 | 只读 |
-
-任务详情里的 `allowed_next_states` 列出当前状态能去哪些状态。完整的迁移规则见 [`diagrams.md`](diagrams.md) 的图 4a。
+| `CANCELLED` | 已取消 | none | 只读 |
 
 ## 接口一览
 
-| 方法和路径 | 用途 | 用在哪个页面 |
+| 方法和路径 | 用途 | 谁能调 |
 |---|---|---|
-| `GET /health` | 健康检查 | |
-| `GET /v1/meta/states` | 状态表 | 看板 |
-| `GET /v1/profiles` | 任务类型配置 | 新建任务、配置页 |
-| `POST /v1/tasks` | 创建任务,自动去重 | 新建任务 |
-| `GET /v1/tasks` | 任务列表,可按 `state`、`requester` 过滤 | 看板 |
-| `GET /v1/tasks/{task_id}` | 任务详情:合约、计划、等待项、交付清单 | 任务详情 |
-| `GET /v1/tasks/{task_id}/events` | 时间线 | 任务详情 |
-| `GET /v1/tasks/{task_id}/actions` | 动作记录 | 任务详情 |
-| `POST /v1/tasks/{task_id}/answer` | 回答澄清问题 | 任务详情 |
-| `POST /v1/tasks/{task_id}/settle` | 验收或退回 | 交付与验收 |
-| `POST /v1/tasks/{task_id}/cancel` | 取消 | 任务详情 |
-| `GET /v1/approvals` | 批准列表,可按 `status` 过滤 | 批准收件箱 |
-| `GET /v1/approvals/{approval_id}` | 批准详情和证据 | 批准收件箱 |
-| `POST /v1/approvals/{approval_id}/decision` | 批准或否决 | 批准收件箱 |
-| `GET /v1/metrics/scorecard` | 记分卡 | 记分卡 |
-| `GET /v1/stream` | 实时事件流 | 所有页面 |
-| `POST /v1/dev/seed` | 重置并载入演示数据 | 联调 |
-| `POST /v1/dev/tasks/{task_id}/simulate` | 模拟 Agent 的一步 | 联调 |
+| `GET /health` | 健康检查,带数据库类型 | 任何人 |
+| `GET /v1/meta/states` | 状态表 | 任何人 |
+| `GET /v1/task-types` | 当前任务类型配置:工具风险分级、上限、放权级别、等待期限 | 任何人 |
+| `POST /v1/tasks` | 创建任务并定义合约,自动去重 | 已识别的用户,即发起人 |
+| `GET /v1/tasks` | 任务列表,可按 `state`、`requester` 过滤 | 已识别的用户 |
+| `GET /v1/tasks/{id}` | 任务详情 | 已识别的用户 |
+| `GET /v1/tasks/{id}/events` | 时间线(审计记录) | 已识别的用户 |
+| `GET /v1/tasks/{id}/actions` | 动作记录 | 已识别的用户 |
+| `GET /v1/tasks/{id}/evaluations` | 委员会对每只股票的结论和专家证据 | 已识别的用户 |
+| `POST /v1/tasks/{id}/advance` | 让 Agent 往下走,直到需要人 | 已识别的用户 |
+| `POST /v1/tasks/{id}/answer` | 回答澄清问题 | 发起人 |
+| `POST /v1/tasks/{id}/settle` | 验收或退回 | 发起人 |
+| `POST /v1/tasks/{id}/cancel` | 取消 | 发起人 |
+| `POST /v1/tasks/{id}/reopen` | 重开已完成的任务 | 发起人 |
+| `POST /v1/tasks/{id}/hand-back` | 转人工后交回 Agent | 接手人 |
+| `GET /v1/approvals` | 批准收件箱,可按 `status` 过滤 | 已识别的用户 |
+| `GET /v1/approvals/{id}` | 批准详情:确切内容和规则 | 已识别的用户 |
+| `POST /v1/approvals/{id}/decision` | 批准或否决 | 发起人和配置管理员以外的人 |
+| `GET /v1/metrics/scorecard` | 记分卡 | 已识别的用户 |
+| `GET /v1/stream` | 实时事件流 | 任何人 |
+| `POST /v1/dev/seed` | 载入演示任务 | 联调 |
+| `POST /v1/dev/clock` | 拨快时钟,处理到期的等待 | 联调 |
+| `POST /v1/dev/broker-fault` | 让模拟券商的下一笔单出故障 | 联调 |
 
-每个接口的完整字段见 `/docs` 页面或 `openapi.json`。下面是最常用的几个。
+## 创建任务
 
-### 创建任务
-
-`POST /v1/tasks`,请求体:
+`POST /v1/tasks`:
 
 ```json
 {
-  "profile_id": "research_paper_order",
-  "title": "研究 ACME 第三季度财报并给出要点",
-  "request_text": "只用公司公告和官方披露。"
+  "goal": "2026-02-10 的价值与质量调仓",
+  "as_of_date": "2026-02-10",
+  "portfolio_capital_usd": 1000000,
+  "max_positions": 3,
+  "orders_optional": true
 }
 ```
 
-新建成功返回 201。去重命中返回 200,`created` 为 `false`,`task` 是已有的那个任务。可选字段 `dedupe_key` 用来传触发事件自带的标识;不传时由任务类型、发起人、标题和请求内容算出。
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `goal` | 是 | 任务目标,写进合约 |
+| `as_of_date` | 否 | 调仓日。缺了或格式不对,任务会停在 `AWAITING_INPUT` 问发起人 |
+| `portfolio_capital_usd` | 否 | 资金。缺了同上 |
+| `markets` | 否 | 研究范围,默认 `["US"]`。超出发起人被授权的市场时同样会问 |
+| `max_positions` | 否 | 最多几只,默认 3 |
+| `orders_optional` | 否 | 下单的批准被否决时,能不能只交付草稿。默认 `true`;为 `false` 时否决下单会让任务以 `DECLINED` 结束 |
+| `trigger_key` | 否 | 触发事件自带的标识,用来去重。不传时由发起人和请求内容算出 |
+
+新建返回 201,去重命中返回 200 且 `created` 为 `false`,`task` 是已有的那个任务:
 
 ```json
-{
-  "task": {
-    "id": "task_c8e9fb2609ae44e6",
-    "profile_id": "research_paper_order",
-    "title": "研究 ACME 第三季度财报并给出要点",
-    "state": "QUEUED",
-    "state_label": "排队",
-    "owner_role": "operator",
-    "requester": "alice",
-    "owner": "alice",
-    "outcome_class": null,
-    "due_at": null,
-    "created_at": "2026-11-22T09:07:10.113032Z",
-    "updated_at": "2026-11-22T09:07:10.113032Z"
-  },
-  "created": true
-}
+{"created": true, "task": {"id": "TASK-40f4d4b068", "state": "RUNNING", "...": "..."}}
 ```
 
-### 任务详情
+## 任务详情
 
-`GET /v1/tasks/{task_id}`。除了列表里的字段,还带合约、计划、未解决的等待项和交付清单。下面是一个等回答的任务(`plan.steps` 和 `success_criteria` 各只留了一条):
+列表里的每个任务:
 
 ```json
 {
-  "id": "task_8633c3e74b004af2",
-  "title": "核对 ACME 与同业的毛利率差异",
-  "state": "AWAITING_INPUT",
-  "state_label": "等回答",
-  "owner_role": "requester",
+  "id": "TASK-40f4d4b068",
+  "task_type": "value_committee_rebalance",
+  "config_version": "3.0.0",
+  "state": "AWAITING_APPROVAL",
+  "state_label": "等批准",
+  "owner_role": "approver",
+  "state_detail": null,
+  "state_version": 6,
   "requester": "alice",
-  "state_version": 3,
-  "allowed_next_states": ["CANCELLED", "HANDED_OFF", "RUNNING"],
-  "contract": {
-    "version": 1,
-    "goal": "核对 ACME 与同业的毛利率差异",
-    "success_criteria": [{"text": "每个数字都引用官方披露", "check": "citation_audit"}],
-    "assumptions": ["币种按披露原币种"]
-  },
-  "plan": {
-    "version": 1,
-    "steps": [{"id": "s1", "title": "检索官方披露", "reversible": true, "status": "pending"}]
-  },
-  "open_wait": {
-    "id": 1,
-    "kind": "INPUT",
-    "addressee": "alice",
-    "question": {
-      "text": "资料范围只用官方披露,还是可以包含媒体报道?",
-      "options": ["只用官方披露", "可以包含媒体报道"],
-      "default": "只用官方披露"
-    },
-    "expires_at": "2026-11-24T09:07:10.088163Z",
-    "on_expiry": "hand_off"
-  },
-  "delivery": null
+  "acting_principal": "quant_research_svc",
+  "markets": ["US"],
+  "wait": {"owner": "portfolio_approver", "deadline": "2026-11-28T09:07:10Z", "on_timeout": "DECLINE"},
+  "usage": {"turns": 22, "spend_usd": 0.21, "retries": 0, "consecutive_denials": 0, "reworks": 0, "reopened": 0},
+  "allowed_next_states": ["RUNNING", "HANDED_OFF", "DECLINED", "CANCELLED"]
 }
 ```
 
-`open_wait.kind` 有三种:`INPUT`(等发起人回答)、`APPROVAL`(等批准,`question.approval_id` 指向批准记录)、`REVIEW`(等验收)。
+- `wait` 只在等待状态出现:等谁(`owner`)、到什么时候(`deadline`)、到期怎么办(`on_timeout`)。到期动作有四种:`HAND_OFF`(转人工)、`DECLINE`(按否决处理)、`COMPLETE`(按验收通过结案)、`ESCALATE`(交给下一个负责人)。到期永远不会当成批准。
+- `state_detail` 是 `LIMIT_REACHED`、`FAILED`、`DECLINED`、`CANCELLED` 的原因,或 `OUTCOME_UNKNOWN` 冻结的动作的幂等键。
+- `usage` 对应任务类型配置里的上限。
 
-### 回答、验收、取消
+`GET /v1/tasks/{id}` 另外带:
 
-| 接口 | 请求体 | 谁能调 | 成功后的状态 |
-|---|---|---|---|
-| `POST /v1/tasks/{id}/answer` | `{"answer": {"choice": "只用官方披露"}}` | 只有发起人 | `RUNNING` |
-| `POST /v1/tasks/{id}/settle` | `{"decision": "accept", "comment": ""}` | 任何已识别的用户 | `COMPLETED` |
-| `POST /v1/tasks/{id}/settle` | `{"decision": "return", "comment": "补上缺口"}` | 任何已识别的用户 | `RUNNING` |
-| `POST /v1/tasks/{id}/cancel` | `{"reason": ""}` | 发起人或负责人 | `CANCELLED` |
+| 字段 | 内容 |
+|---|---|
+| `open_questions` | `AWAITING_INPUT` 时要发起人回答的问题,例如 `["missing_as_of_date"]` |
+| `contract` | 合约:目标、调仓日、范围、资金(分)、上限、验收标准、假设 |
+| `approvals` | 这个任务的批准,格式同批准收件箱 |
+| `draft` | 最新的调仓草稿:`draft_id`、`as_of_date`、`weights`(基点) |
+| `delivery` | 交付清单:`completeness`(`COMPLETE`、`PARTIAL`)、逐条验收结果 `criteria_results`、缺口 `gaps`、权重、花费 |
+| `handoff` | 交接包:原因、已完成和未完成的动作、已有权重、待回答的问题、接手人 |
 
-三个接口都返回更新后的任务详情。
+## 推进
 
-### 批准
+`POST /v1/tasks/{id}/advance` 让 Agent 一直做下去,直到需要人:研究、写草稿、下单、验收、交付。可以随时、重复调用,每一步都从数据库重新读。返回 `{step, task}`,`step.kind` 有五种:
 
-`GET /v1/approvals?status=PENDING` 是批准收件箱。每条批准带一份由代码整理的证据 `evidence`:
+| `step.kind` | 意思 | 前端接着做什么 |
+|---|---|---|
+| `needs_approval` | 一个动作等人批准,带 `approval_id` 和 `tool` | 去批准收件箱 |
+| `denied` | 闸门拒绝了这个动作,`reason` 是原因,例如 `business_rule_violation:vetoed_ticker_in_portfolio:TRAP_CO` | 展示原因。连续被拒到上限后任务会停下 |
+| `delivered` | 已验收并交付,任务进入 `SETTLING`,带 `completeness` 和 `gaps` | 请发起人验收 |
+| `handed_off` | 转人工了,`owner` 是接手人 | 展示交接包 |
+| `waiting` | 任务在等人或已结束,`state` 是当前状态 | 无 |
+
+验收只看库里的事实:专家引用的记录在调仓日之前已公开,草稿里没有被否决的股票,权重满足总量、单只、行业和流动性上限,每个动作都已核对并且券商那边还能读到一样的单。没通过会自动返工,返工次数用完就转人工。
+
+## 回答、验收、取消、重开、交回
+
+| 接口 | 请求体 | 成功后 |
+|---|---|---|
+| `POST /v1/tasks/{id}/answer` | 和创建任务一样的字段,补全缺的那项 | `RUNNING`,或者还缺东西时仍是 `AWAITING_INPUT`。返回 `{open_questions, task}` |
+| `POST /v1/tasks/{id}/settle` | `{"decision": "accept", "review_minutes": 3}` | `COMPLETED`。`review_minutes` 计入人工成本 |
+| `POST /v1/tasks/{id}/settle` | `{"decision": "return", "comment": "补上缺口"}` | `RUNNING`,算一次返工 |
+| `POST /v1/tasks/{id}/cancel` | `{"reason": "不需要了"}` | `CANCELLED` |
+| `POST /v1/tasks/{id}/reopen` | `{"reason": "发现公司行动遗漏"}` | `RUNNING`,算一次返工 |
+| `POST /v1/tasks/{id}/hand-back` | 无 | `RUNNING` |
+
+都返回更新后的任务详情(`answer` 除外,见上)。发起人在验收窗口内既不验收也不退回,窗口结束时按验收通过结案。
+
+## 批准
+
+`GET /v1/approvals?status=PENDING` 是收件箱,`status` 可以是 `PENDING`、`APPROVED`、`REJECTED`、`CONSUMED`、`EXPIRED`。每条:
 
 ```json
 {
-  "id": "apr_a5b4127066ff472c",
-  "op_id": "op_c5cf516395cf4e53",
-  "task_id": "task_f2da1457a2dd4536",
-  "args_hash": "53556f07849906077393a98bad38186f9003853dee521928db3c7256db26b287",
-  "evidence": {
-    "payload": {"symbol": "ACME", "side": "buy", "quantity": 100, "order_type": "limit", "limit_price": "12.50", "venue": "paper"},
-    "rule": "create_order_request 属于 R3,必须人工批准",
-    "estimated_notional": "1250.00",
-    "position_before": 0,
-    "position_after": 100,
-    "basis": ["ACME 第三季度公告", "研究报告草稿 v1"],
-    "model_note": {"text": "限价低于最近成交价", "trusted": false}
-  },
-  "required_role": "approver",
+  "id": "APR-5d74dcf00084",
+  "task_id": "TASK-5de74f48b8",
+  "tool": "submit_paper_orders",
+  "target": "paper_broker:2026-02-10",
+  "tier": "R3",
+  "rule": "R3: consequential and not reversible; a person approves this exact payload, once",
+  "payload": {"draft_id": "DRAFT-TASK-5de74f48b8", "as_of_date": "2026-02-10", "weights_bps": {"AAPL_MOAT": 2681, "CAT_IND": 3500, "MSFT_QUAL": 3144}, "markets": ["US"], "portfolio_capital_cents": 100000000},
+  "payload_hash": "b0a97a2791c14219...",
   "status": "PENDING",
+  "requester": "pm_alice",
   "approver": null,
-  "reason": "",
-  "created_at": "2026-11-22T09:07:10.090548Z",
-  "expires_at": "2026-11-23T09:07:10.090548Z",
-  "decided_at": null
+  "note": null,
+  "expires_at": "2026-11-28T09:07:10Z"
 }
 ```
 
-界面上要把 `evidence.payload`(确切内容)和 `evidence.rule` 放在最显眼的位置。`model_note` 是模型自己的说法,`trusted` 为 `false`,要和事实分开显示。
+界面上把 `payload`(批准的确切内容)和 `rule` 放在最显眼的位置。批准只对这个 `payload_hash` 有效、只能用一次。
 
-`POST /v1/approvals/{approval_id}/decision`,请求体 `{"decision": "approve", "reason": "金额在额度内"}` 或 `{"decision": "reject", "reason": "超出额度"}`。
+`POST /v1/approvals/{id}/decision`,请求体 `{"decision": "approve", "reason": "在额度内"}` 或 `{"decision": "reject", "reason": "超出额度"}`。返回更新后的批准。
 
-- 批准人不能是任务的发起人,否则 403 `self_approval_forbidden`。
-- 批准后任务回到 `RUNNING`,动作状态变为 `APPROVED`。
-- 否决后任务变为 `DECLINED`。等 Agent 接入后,能绕开被否决动作的任务会回到 `RUNNING`,这一点以后会变。
-- 过期的批准不能再批,返回 409 `approval_expired`,任务变为 `DECLINED`。
+- 发起人和配置管理员不能批准,返回 403 `self_approval_forbidden`。
+- 批准后任务回到 `RUNNING`,再推进时闸门核对并用掉这条批准。
+- 否决草稿(R2)时任务以 `DECLINED` 结束。否决下单(R3)时,合约允许(`orders_optional`)就回到 `RUNNING`,只交付草稿,交付清单为 `PARTIAL`;不允许就以 `DECLINED` 结束。
+- 过期的批准不能再批,返回 409 `approval_expired`,同时按否决处理。没人处理的批准到期时,后台也会这样处理。
 
-### 记分卡
+## 记分卡
 
 `GET /v1/metrics/scorecard`:
 
 ```json
 {
-  "tasks_by_state": {"RUNNING": 2, "COMPLETED": 1, "SETTLING": 1},
-  "total_tasks": 8,
-  "completed": 1,
-  "closed": 1,
-  "total_cost": 0.358,
-  "human_minutes": 11,
-  "cost_per_successful_task": 0.358,
-  "approvals_by_status": {"APPROVED": 1, "PENDING": 1}
+  "tasks_by_state": {"AWAITING_APPROVAL": 2, "COMPLETED": 1, "SETTLING": 1},
+  "approvals_by_status": {"CONSUMED": 5, "PENDING": 2, "REJECTED": 1},
+  "unit_economics": {
+    "ended_tasks": 3,
+    "completed_tasks": 1,
+    "api_and_tool_usd": 0.44,
+    "human_minutes": 2.0,
+    "all_in_cost_usd": 4.44,
+    "cost_per_completed_task_usd": 4.44
+  },
+  "human_hourly_rate_usd": 120.0
 }
 ```
 
-`cost_per_successful_task` 是全部任务的成本除以已完成的任务数,没有已完成任务时为 `null`。`tasks_by_state` 只包含数量不为零的状态。
+单位成本只算已经结束的任务(完成、失败、被否决、取消、转人工):它们的全部成本(接口和工具花费,加上人工时间按小时费率折算)除以完成的任务数。重开后再完成的任务只算一次,进行中的任务不计入。没有完成的任务时为 `null`。
 
 ## 实时事件
 
-`GET /v1/stream` 是 Server-Sent Events。任务被创建或状态变化时推一条,每 15 秒有一条心跳注释。
+`GET /v1/stream` 是 Server-Sent Events。任务被创建或发生变化时推一条,包括后台处理到期等待造成的变化;每 15 秒一条心跳注释。
 
 ```js
-const es = new EventSource("http://localhost:8000/v1/stream");
+const es = new EventSource("http://127.0.0.1:8000/v1/stream");
+es.addEventListener("task.created", (e) => { /* 列表失效重取 */ });
 es.addEventListener("task.updated", (e) => {
   const { task_id, state, state_version } = JSON.parse(e.data);
-  // 重新取这个任务的详情,或者让列表失效重取
+  // 重新取这个任务的详情
 });
-es.addEventListener("task.created", (e) => { /* 同上 */ });
 ```
 
-事件只带 `{type, task_id, state, state_version}`,不带完整任务。收到后重新请求详情。
+事件只带 `{type, task_id, state, state_version}`。客户端跟不上时会漏掉一些,收到下一条时重取即可。
 
 ## 联调接口
 
-`/v1/dev/*` 只在 `AITRADER_ENABLE_DEV_ENDPOINTS=true` 时存在,上线会关掉。
+`/v1/dev/*` 只在 `serve --dev` 或环境变量 `AITRADER_ENABLE_DEV_ENDPOINTS=true` 时存在,上线不开。
 
-### 载入演示数据
+`POST /v1/dev/seed` 用真实的用例造出八个演示任务,发起人都是 `alice`。重复调用不会重复创建。
 
-`POST /v1/dev/seed` 清空所有表,载入一个任务类型 `research_paper_order` 和八个任务。公司名和数字都是虚构的。
+| 名字 | 状态 | 怎么来的 |
+|---|---|---|
+| `queued` | `QUEUED` | 只受理 |
+| `needs-input` | `AWAITING_INPUT` | 请求里没写调仓日 |
+| `draft-approval` | `AWAITING_APPROVAL` | 研究完,草稿等批准 |
+| `order-approval` | `AWAITING_APPROVAL` | `bob` 批了草稿,下单等批准 |
+| `settling` | `SETTLING` | 两次都批了,已交付 |
+| `completed` | `COMPLETED` | 再由 `alice` 验收 |
+| `declined` | `DECLINED` | `bob` 否决了草稿 |
+| `handed-off` | `HANDED_OFF` | 直接转人工 |
 
-| 任务标题 | 状态 |
-|---|---|
-| ACME 管理层变动梳理 | `QUEUED` |
-| 研究 ACME 第三季度财报并给出要点 | `RUNNING` |
-| 核对 ACME 与同业的毛利率差异 | `AWAITING_INPUT` |
-| ACME 模拟盘买入 100 股,限价 12.50 | `AWAITING_APPROVAL` |
-| ACME 模拟盘卖出 50 股 | `OUTCOME_UNKNOWN` |
-| 汇总 ACME 近三年现金流 | `LIMIT_REACHED` |
-| 整理 ACME 风险因素清单 | `SETTLING` |
-| ACME 估值区间研究 | `COMPLETED` |
+`POST /v1/dev/clock`,请求体 `{"advance_s": 86401}`:把时钟拨快,然后处理所有到期的等待,返回 `{now, handled}`。可以用来看批准过期、验收窗口结束、问题没人回答时转人工。
 
-### 模拟 Agent 的一步
-
-`POST /v1/dev/tasks/{task_id}/simulate`,请求体 `{"step": "start"}`。返回更新后的任务详情。当前状态不允许这一步时返回 409 `invalid_transition`。
-
-| `step` | 要求的当前状态 | 之后的状态 | 同时生成的记录 |
-|---|---|---|---|
-| `start` | `QUEUED` | `RUNNING` | 合约和计划(没有时)、一条模型成本 |
-| `ask` | `RUNNING` | `AWAITING_INPUT` | 一个 `INPUT` 等待项,带问题和选项 |
-| `request_approval` | `RUNNING` | `AWAITING_APPROVAL` | 一条 R3 动作、一条待批准记录、一个 `APPROVAL` 等待项、一条审计记录 |
-| `unknown_outcome` | `RUNNING` | `OUTCOME_UNKNOWN` | 把已批准的动作标为 `UNKNOWN`,没有就新建一条 |
-| `resolve_unknown` | `OUTCOME_UNKNOWN` | `RUNNING` | `UNKNOWN` 的动作变为 `CONFIRMED`,带外部回执 |
-| `limit` | `RUNNING` | `LIMIT_REACHED` | 无 |
-| `extend_limit` | `LIMIT_REACHED` | `RUNNING` | 无 |
-| `claim_done` | `RUNNING` 或 `LIMIT_REACHED` | `VERIFYING` | 无 |
-| `rework` | `VERIFYING` | `RUNNING` | 无 |
-| `deliver` | `VERIFYING` | `SETTLING` | 逐条验收结果、交付清单、一个 `REVIEW` 等待项、一条评分成本 |
-| `fail` | `QUEUED`、`RUNNING` 或 `VERIFYING` | `FAILED` | 无。有结果未知的动作时会被拒绝 |
-| `hand_off` | 任何未结束的状态 | `HANDED_OFF` | 一条交接包事件 |
-
-`deliver` 可以加 `"partial": true`,交付清单的 `outcome_class` 变为 `partial`,最后一条标准标为未达成。
+`POST /v1/dev/broker-fault`,请求体 `{"fault": "timeout_after_fill"}` 或 `{"fault": "drop_before_fill"}`:模拟券商的下一笔单超时。前者是单已成交但回执丢了,后者是请求没到券商。推进时任务先进入 `OUTCOME_UNKNOWN`,再按券商那边的记录对账:成交了就记为已完成,没到就重发一次,不会下第二笔单。
 
 ## 联调脚本
 
-把一个任务从排队走到完成,覆盖批准和验收两个人工环节。先设好地址:
+一个任务从创建走到完成,经过两次批准和一次验收。
 
 ```bash
-B=http://localhost:8000
-```
+B=http://127.0.0.1:8000
+J='Content-Type: application/json'
 
-1. 重置数据,取一个排队中的任务:
+# 1. 创建,记下返回的 task.id
+curl -s -X POST -H "X-User-Id: alice" -H "$J" $B/v1/tasks \
+  -d '{"goal":"调仓","as_of_date":"2026-02-10","portfolio_capital_usd":1000000}'
+TID=<task.id>
 
-```bash
-curl -s -X POST $B/v1/dev/seed
-curl -s -H "X-User-Id: alice" "$B/v1/tasks?state=QUEUED"
-```
+# 2. 推进:研究完,草稿等批准。记下 step.approval_id
+curl -s -X POST -H "X-User-Id: ops" $B/v1/tasks/$TID/advance
+AID=<step.approval_id>
 
-2. 把上一步返回的任务 `id` 记为 `TID`,模拟 Agent 开始并请求批准:
+# 3. 发起人自己批会被拒(403),换 bob 批
+curl -s -X POST -H "X-User-Id: alice" -H "$J" -d '{"decision":"approve"}' $B/v1/approvals/$AID/decision
+curl -s -X POST -H "X-User-Id: bob" -H "$J" -d '{"decision":"approve"}' $B/v1/approvals/$AID/decision
 
-```bash
-curl -s -X POST -H "Content-Type: application/json" -d '{"step":"start"}' $B/v1/dev/tasks/$TID/simulate
-curl -s -X POST -H "Content-Type: application/json" -d '{"step":"request_approval"}' $B/v1/dev/tasks/$TID/simulate
-```
+# 4. 再推进:写草稿,下单等批准。bob 批完再推进:下单、核对、验收、交付
+curl -s -X POST -H "X-User-Id: ops" $B/v1/tasks/$TID/advance
+curl -s -X POST -H "X-User-Id: bob" -H "$J" -d '{"decision":"approve"}' $B/v1/approvals/<新的 approval_id>/decision
+curl -s -X POST -H "X-User-Id: ops" $B/v1/tasks/$TID/advance
 
-3. 批准人查看收件箱。把这个任务对应的批准 `id` 记为 `AID`:
-
-```bash
-curl -s -H "X-User-Id: bob" "$B/v1/approvals?status=PENDING"
-```
-
-4. 发起人自己批准会被拒绝(403),换批准人批准:
-
-```bash
-curl -s -X POST -H "X-User-Id: alice" -H "Content-Type: application/json" -d '{"decision":"approve"}' $B/v1/approvals/$AID/decision
-curl -s -X POST -H "X-User-Id: bob" -H "Content-Type: application/json" -d '{"decision":"approve","reason":"金额在额度内"}' $B/v1/approvals/$AID/decision
-```
-
-5. 模拟 Agent 做完并交付,然后验收:
-
-```bash
-curl -s -X POST -H "Content-Type: application/json" -d '{"step":"claim_done"}' $B/v1/dev/tasks/$TID/simulate
-curl -s -X POST -H "Content-Type: application/json" -d '{"step":"deliver"}' $B/v1/dev/tasks/$TID/simulate
-curl -s -X POST -H "X-User-Id: bob" -H "Content-Type: application/json" -d '{"decision":"accept"}' $B/v1/tasks/$TID/settle
-```
-
-6. 看时间线和记分卡:
-
-```bash
+# 5. 发起人验收,然后看时间线和记分卡
+curl -s -X POST -H "X-User-Id: alice" -H "$J" -d '{"decision":"accept","review_minutes":3}' $B/v1/tasks/$TID/settle
 curl -s -H "X-User-Id: alice" $B/v1/tasks/$TID/events
 curl -s -H "X-User-Id: alice" $B/v1/metrics/scorecard
 ```
 
-同样的流程在 `backend/tests/test_api.py` 里有自动化版本。
+同样的流程在 `crates/trade-server/tests/api.rs` 里有自动化版本。
 
 ## 现在还没有的
 
-前端先不要依赖这些,后面会补:
+前端先不要依赖这些:
 
-- 真实登录和角色。现在任何人写什么 `X-User-Id` 就是谁,「批准人」也没有角色校验,只校验不是发起人。
-- 加额度(`LIMIT_REACHED` 的出口)、转人工后的接手和交回、重开已完成任务,这几个操作的正式接口。目前只能用 `simulate`。
-- 任务类型配置的增删改。现在只读。
-- 等待项到期的自动处理。现在只有在有人去操作一条过期的批准时才会处理。
+- 真实登录和角色。现在 `X-User-Id` 写什么就是谁;批准只校验不是发起人和配置管理员,不校验批准人角色。
+- 机器可读的接口定义(OpenAPI)。原来的 `openapi.json` 是 Python 版生成的,已删除。
+- 加额度(`LIMIT_REACHED` 之后继续做)的接口。现在只能验收已完成的部分。
+- 任务类型配置的增删改。现在从 `config/task_types/` 读,改了要重启并升版本号。
 - 事件流的身份校验和断线续传。
+- 模型。现在三个专家是确定性的规则,`advance` 由人或脚本调用;接入模型后由后台任务驱动。

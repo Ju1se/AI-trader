@@ -379,7 +379,20 @@ async fn detail(h: &Harness, id: &TaskId) -> ApiResult<Value> {
         .iter()
         .map(|a| approval_view(h, a))
         .collect();
+    // What FRAME asked, from the event that put the task in AWAITING_INPUT.
+    let mut questions: Vec<String> = Vec::new();
+    if matches!(task.state(), TaskState::AwaitingInput(_)) {
+        let events = h.store.events(id).await?;
+        if let Some(asked) = events
+            .iter()
+            .rev()
+            .find_map(|e| e.detail.strip_prefix("needs_input:"))
+        {
+            questions = asked.split(',').map(str::to_string).collect();
+        }
+    }
     let mut view = task_view(&task);
+    view["open_questions"] = json!(questions);
     view["contract"] = json!(h.store.contract(id).await?);
     view["approvals"] = json!(approvals);
     view["draft"] = json!(h.store.latest_draft(id).await?);

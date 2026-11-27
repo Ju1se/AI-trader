@@ -286,10 +286,6 @@ impl AgentEvidenceOutput {
         }
         Ok(())
     }
-
-    pub fn display_score(&self) -> f64 {
-        ((self.score + 1.0) * 50.0 * 100.0).round() / 100.0
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
