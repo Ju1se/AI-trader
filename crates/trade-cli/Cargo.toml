@@ -1,0 +1,16 @@
+[package]
+name = "trade-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+trade-core = { path = "../trade-core" }
+trade-quant = { path = "../trade-quant" }
+trade-workers = { path = "../trade-workers" }
+trade-gate = { path = "../trade-gate" }
+trade-broker = { path = "../trade-broker" }
+trade-store = { path = "../trade-store" }

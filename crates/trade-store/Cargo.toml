@@ -1,0 +1,18 @@
+[package]
+name = "trade-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Architectural Requirement #2: `trade-store` is the ONLY crate accessing the database (`sqlx`).
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+trade-core = { path = "../trade-core" }
+trade-quant = { path = "../trade-quant" }
+trade-workers = { path = "../trade-workers" }
+trade-gate = { path = "../trade-gate" }
+
+[dev-dependencies]
+tokio = { workspace = true }
