@@ -1,52 +1,69 @@
-# Trade AI — Agent 1–7 Governed Multi-Agent Value Investing MVP
+# Trade AI — Pure Rust Agent 1–7 Governed Multi-Agent Value Investing System
 
-An auditable, Point-in-Time (PIT) value investing research and paper-execution system built directly on the engineering control architecture in `Agent 1`–`Agent 7` and the quantitative value investing design in `资料/deep-research-report.md` and `资料/8 Common Backtesting Pitfalls Exercise.pdf`.
+A 100% safe-Rust (`#![forbid(unsafe_code)]` across all workspace crates) quantitative value investing research, governance, and paper-execution system implementing `Agent 1`–`Agent 7` (Diagrams 3a, 3b, 4a, 4b), `资料/deep-research-report.md`, and `资料/8 Common Backtesting Pitfalls Exercise.pdf`.
 
-## Architecture Overview
+## Cargo Workspace Crate Isolation
 
 ```text
-PREPARE (TaskTypeConfig: ShapeLevel, RiskTier R0-R4, AutonomyLevel, BudgetLimits)
-   │
-   ▼
-ADMIT (Trigger Deduplication -> Principal & Scope -> External SQLite State Machine)
-   │
-   ▼
-FRAME (Ambiguity Clarification -> Pinned TaskContract -> Untrusted Data Envelopes)
-   │
-   ├──► Deterministic 15-Factor Quant Engine (Fixed Workflow: PIT, Industry-Neutral, Hard Vetoes)
-   └──► Read-Only Specialist Workers (Moat, Management/CapAlloc, Footnote Forensics)
-   │
-   ▼
-ACT (Fixed 9-Step Gate -> Payload-Bound Approval -> Intent Ledger -> Credential Proxy -> Read-Back)
-   │
-   ▼
-CLOSE (Independent Verifier -> Delivery Manifest -> Settlement/Reopen -> Unit Economics & Curated Memory)
+                       ┌──────────────────┐
+                       │    trade-core    │  sha2, serde, serde_json
+                       │ 13 States (4a),  │  Private state + transition()
+                       │ R0-R4 Tiers (3a),│  PreDispatch vs PostDispatchUnknown
+                       │ PIT Date Types   │
+                       └────────┬─────────┘
+                                │
+        ┌───────────────────────┼───────────────────────┬───────────────────┐
+        ▼                       ▼                       ▼                   ▼
+┌───────────────┐       ┌───────────────┐       ┌───────────────┐   ┌───────────────┐
+│  trade-quant  │       │  trade-gate   │       │  trade-store  │   │ trade-broker  │
+│ 15 Factors &  │       │ ONLY depends  │       │ ONLY crate w/ │   │ Standalone    │
+│ PIT Backtest  │       │ on trade-core!│       │ sqlx! SQLite &│   │ PaperBroker   │
+└───────┬───────┘       │ Generic Tool  │       │ PostgreSQL +  │   │ Adapter       │
+        │               │ & GateLedger  │       │ migrations/   │   └───────┬───────┘
+        ▼               └───────┬───────┘       └───────┬───────┘           │
+┌───────────────┐               │                       │                   │
+│ trade-workers │               │                       │                   │
+│ Read-Only     │               │                       │                   │
+│ Workers +     │               │                       │                   │
+│ Committee     │               │                       │                   │
+└───────┬───────┘               │                       │                   │
+        └───────────────────────┴───────────┬───────────┴───────────────────┘
+                                            ▼
+                                    ┌───────────────┐
+                                    │   trade-cli   │
+                                    │ Tool Impls,   │
+                                    │ DB Verifier,  │
+                                    │ CLI & Parity  │
+                                    └───────────────┘
 ```
 
-See [docs/architecture-mapping.md](docs/architecture-mapping.md) for the full 25-node mapping from `Agent 7 Workflow Trigger to Verified Close.xmind`.
+## Key Architectural Guarantees
 
-## Zero-Dependency Design
-Implemented cleanly in **Python 3.12+ standard library** (`sqlite3`, `dataclasses`, `enum`, `hashlib`, `json`, `unittest`, `urllib.request`) with zero mandatory third-party packages.
+1. **Physical Crate Isolation**:
+   - `trade-store` is the **only** crate depending on `sqlx`, managing schema via portable ANSI SQL in [migrations/](migrations/) (seamless switch between `sqlite://` and `postgres://`).
+   - `trade-gate` depends **only** on `trade-core` and invokes tools through the generic `Tool` trait (zero hardcoded tool names).
+   - `trade-workers` hosts read-only specialist workers and `InvestmentCommittee` with zero database or broker dependencies.
+   - `trade-broker` provides an independent `PaperBrokerAdapter` decoupled from the storage layer.
+2. **Diagram 4a State Machine & Optimistic Concurrency**:
+   - Exact 13 states: `QUEUED`, `RUNNING`, `AWAITING_INPUT`, `AWAITING_APPROVAL`, `OUTCOME_UNKNOWN`, `LIMIT_REACHED`, `VERIFYING`, `SETTLING`, `COMPLETED`, `FAILED`, `HANDED_OFF`, `DECLINED`, `CANCELLED`.
+   - `TaskRecord.state` is private and only mutable via `TaskRecord::transition()`, persisted with `version` optimistic locking.
+3. **Diagram 3a & 3b Gate & Approval Rules**:
+   - Unconfigured tools are immediately rejected; `R4` is permanently prohibited; order submission is `R3`; draft creation is `R2`.
+   - Approvals live exclusively in the database (`PENDING -> APPROVED | REJECTED -> CONSUMED` in a single transaction with `DISPATCHED` intent registration).
+   - Authoritative veto lists and verification inputs are read directly from `DbStore` & `PaperBrokerAdapter`, never accepted from callers.
+   - Algebraic `GateError` separates `PreDispatch` rejections from `PostDispatchUnknown` errors, unconditionally freezing tasks in `OUTCOME_UNKNOWN` upon any post-dispatch failure.
 
 ## Quickstart
 
-Run the full automated test suite:
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
+# Run all unit and integration tests across all 6 crates
+cargo test --workspace --offline
 
-Run the end-to-end demo (PIT backtest pitfall audit + full 5-stage `Agent 7` research & paper execution lifecycle):
-```bash
-PYTHONPATH=src python3 -m trade_ai.cli demo
-```
+# Run end-to-end demo (item-by-item parity with v0.1-python-mvp)
+cargo run --offline -p trade-cli -- demo
 
-Run standalone backtest or point-in-time research:
-```bash
-PYTHONPATH=src python3 -m trade_ai.cli backtest
-PYTHONPATH=src python3 -m trade_ai.cli research --as-of 2026-02-10
-PYTHONPATH=src python3 -m trade_ai.cli research --as-of 2026-05-01
+# Standalone backtest, single-date research, and Rust throughput benchmark
+cargo run --offline -p trade-cli -- backtest
+cargo run --offline -p trade-cli -- research --as-of 2026-02-10
+cargo run --release --offline -p trade-cli -- bench
 ```
-
-## Extending to Live Data & Live LLM Reasoning
-- **Live Filings & Market Data**: Ingest SEC EDGAR / Wind / CSMAR snapshots into `pit_securities`, `pit_financials`, `pit_prices`, and `pit_filings` in `StateAndPITStore`, preserving exact `filing_date` timestamps.
-- **Live LLM Synthesis**: Configure `TRADE_AI_LLM_API_KEY` and `TRADE_AI_LLM_ENDPOINT` in `CredentialVault` / environment and pass `LLMJsonReasoner` into `TradeAIHarness`. Workers remain read-only and all retrieved filings stay wrapped inside `<untrusted_data>` envelopes.
