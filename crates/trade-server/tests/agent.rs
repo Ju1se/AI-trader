@@ -208,6 +208,54 @@ async fn reads_go_through_the_gate() {
     assert!(!script.last_prompt().contains("read_pit_"));
 }
 
+/// Diagram 2 with the model: a draft before research waits for research. Once a person
+/// refuses the orders, the plan drops them in a new version, and proposing them again is
+/// refused without asking a person a second time.
+#[tokio::test]
+async fn the_plan_orders_the_steps_and_a_refused_step_stays_dropped() {
+    let (h, script) = agent_harness(
+        common::harness().await,
+        &[
+            COMMITTEE_DRAFT,
+            r#"{"tool": "research", "args": {}}"#,
+            COMMITTEE_DRAFT,
+            r#"{"tool": "submit_paper_orders", "args": {}}"#,
+            r#"{"tool": "submit_paper_orders", "args": {}}"#,
+            r#"{"tool": "finish", "args": {"note": "the draft alone"}}"#,
+        ],
+    )
+    .await;
+    let task = common::start(&h, "2026-02-10").await;
+    let step = h.advance(&task).await.unwrap();
+    let step = approve(&h, step, true).await;
+    let step = approve(&h, step, false).await;
+    let Step::Delivered(manifest) = step else {
+        panic!("{step:?}")
+    };
+    assert_eq!(manifest.completeness, Completeness::Partial);
+    let said = transcript(&h, &task).await.join("\n");
+    for refusal in [
+        "create_rebalance_draft: refused: business_rule_violation:step_waits_for:research",
+        "submit_paper_orders: refused: business_rule_violation:step_skipped:orders",
+    ] {
+        assert!(said.contains(refusal), "{said}");
+    }
+    let order_requests = h
+        .store
+        .task_approvals(&task)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.tool_name == "submit_paper_orders")
+        .count();
+    assert_eq!(order_requests, 1, "a person is not asked a second time");
+    let plan = h.store.plan(&task).await.unwrap().unwrap();
+    assert_eq!(plan.version, 2);
+    assert!(plan.step("orders").unwrap().skipped);
+    assert!(script.last_prompt().contains("orders skipped"));
+    assert_eq!(h.broker.count_orders_for_task(&task), 0);
+}
+
 /// C2 with the model: refused orders are skipped, and the model is told before it finishes.
 #[tokio::test]
 async fn refused_orders_are_reported_to_the_model_and_the_draft_delivered() {

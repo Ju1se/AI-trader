@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use sqlx::{Any, AnyConnection, FromRow, Transaction};
 use trade_core::{
-    DeliveryManifest, GateError, HandoffPackage, IdempotencyKey, PreDispatchError, TaskContract,
-    TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, UsdCents, WaitMetadata,
+    DeliveryManifest, GateError, HandoffPackage, IdempotencyKey, Plan, PreDispatchError,
+    TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, UsdCents,
+    WaitMetadata,
 };
 
 use crate::{Change, Store, all, count, db, from_json, to_json};
@@ -137,6 +138,28 @@ pub(crate) async fn unsettled_action_in(
 
 /// Save `task` if the stored version is still `task.version()`, and log the change, in
 /// the caller's transaction. Returns the new version.
+pub(crate) async fn insert_plan_in(
+    conn: &mut AnyConnection,
+    task_id: &TaskId,
+    plan: &Plan,
+    reason: &str,
+    now: i64,
+) -> Result<(), GateError> {
+    sqlx::query(
+        "INSERT INTO plans (task_id, version, plan_json, reason, created_epoch_s)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(task_id.as_str())
+    .bind(i64::from(plan.version))
+    .bind(to_json(plan)?)
+    .bind(reason)
+    .bind(now)
+    .execute(conn)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 /// Save `task` with `change` in `tx`, commit, and give `task` its new version.
 pub(crate) async fn commit_task(
     mut tx: Transaction<'static, Any>,
@@ -565,6 +588,26 @@ impl Store {
     pub async fn handoff(&self, task_id: &TaskId) -> Result<Option<HandoffPackage>, GateError> {
         self.json_by_task(
             "SELECT package_json FROM handoffs WHERE task_id = $1",
+            task_id,
+        )
+        .await
+    }
+
+    /// A new version of the task's plan (Diagram 2). Versions are never overwritten.
+    pub async fn save_plan(
+        &self,
+        task_id: &TaskId,
+        plan: &Plan,
+        reason: &str,
+    ) -> Result<(), GateError> {
+        let mut conn = self.pool.acquire().await.map_err(db)?;
+        insert_plan_in(&mut conn, task_id, plan, reason, self.now()).await
+    }
+
+    /// The plan in force: its newest version.
+    pub async fn plan(&self, task_id: &TaskId) -> Result<Option<Plan>, GateError> {
+        self.json_by_task(
+            "SELECT plan_json FROM plans WHERE task_id = $1 ORDER BY version DESC LIMIT 1",
             task_id,
         )
         .await

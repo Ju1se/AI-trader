@@ -135,7 +135,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 {
   "id": "TASK-40f4d4b068",
   "task_type": "value_committee_rebalance",
-  "config_version": "3.1.0",
+  "config_version": "3.2.0",
   "state": "AWAITING_APPROVAL",
   "state_label": "等批准",
   "owner_role": "approver",
@@ -160,6 +160,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 |---|---|
 | `open_questions` | `AWAITING_INPUT` 时要发起人回答的问题,例如 `["missing_as_of_date"]` |
 | `contract` | 合约:目标、调仓日、范围、资金(分)、上限、验收标准、假设 |
+| `plan` | 计划(图 2):`version` 和 `steps`,每一步有 `id`、`tool`、`depends_on`、`skippable` 和 `status`(`done`、`ready`、`blocked`、`skipped`)。有人否决可以跳过的步骤后,`version` 加一、那一步变成 `skipped` |
 | `approvals` | 这个任务的批准,格式同批准收件箱 |
 | `draft` | 最新的调仓草稿:`draft_id`、`as_of_date`、`weights`(基点) |
 | `delivery` | 交付清单:`completeness`(`COMPLETE`、`PARTIAL`)、逐条验收结果 `criteria_results`、缺口 `gaps`、权重、花费 |

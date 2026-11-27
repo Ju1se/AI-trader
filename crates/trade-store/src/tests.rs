@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 
 use sqlx::Connection;
 use trade_core::{
-    ActionIntentStatus, ApprovalStatus, AsOfDate, AutonomyLevel, BudgetLimits, Completeness,
-    CostEntry, DeliveryManifest, ExecError, GateError, HandoffPackage, IdempotencyKey,
-    PreDispatchError, RiskTier, ShapeLevel, TaskId, TaskRecord, TaskState, TaskTypeConfig,
-    TimeoutAction, UsdCents, WaitMetadata,
+    ActionIntentStatus, ApprovalId, ApprovalRecord, ApprovalStatus, AsOfDate, AutonomyLevel,
+    BudgetLimits, Completeness, CostEntry, DeliveryManifest, ExecError, GateError, HandoffPackage,
+    IdempotencyKey, PreDispatchError, RiskTier, ShapeLevel, TaskId, TaskRecord, TaskState,
+    TaskTypeConfig, TimeoutAction, UsdCents, WaitMetadata,
 };
 use trade_gate::{
     DispatchResult, GateLedger, GateOutcome, GateRequest, Tool, VerifiedGateTicket, run,
@@ -44,6 +44,7 @@ fn config() -> TaskTypeConfig {
         budget_limits: BudgetLimits::default(),
         done_criteria: vec!["weights_delivered".into()],
         waits: Default::default(),
+        plan: Vec::new(),
     }
 }
 
@@ -69,6 +70,21 @@ async fn running(store: &Store, id: &str) -> TaskRecord {
     task.transition(TaskState::Running, store.now()).unwrap();
     store.save(&mut task, "start", "test").await.unwrap();
     task
+}
+
+/// The stored approval with bob's decision on it.
+async fn decided(
+    store: &Store,
+    id: &ApprovalId,
+    status: ApprovalStatus,
+    note: Option<&str>,
+) -> ApprovalRecord {
+    ApprovalRecord {
+        status,
+        approver_id: Some("bob".into()),
+        decision_note: note.map(str::to_string),
+        ..store.approval(id).await.unwrap().unwrap()
+    }
 }
 
 async fn reload(store: &Store, task: &TaskRecord) -> TaskRecord {
@@ -141,15 +157,9 @@ async fn approved_order(store: &Store, task: &TaskRecord, tool: &Order) -> GateR
     };
     let mut task = reload(store, task).await;
     task.transition(TaskState::Running, store.now()).unwrap();
+    let decision = decided(store, &approval_id, ApprovalStatus::Approved, None).await;
     store
-        .decide_approval(
-            &approval_id,
-            ApprovalStatus::Approved,
-            Some("bob"),
-            None,
-            &mut task,
-            "bob",
-        )
+        .decide_approval(&decision, &mut task, "bob", None)
         .await
         .unwrap();
     req.approval_id = Some(approval_id);
@@ -282,15 +292,15 @@ async fn a_rejection_after_the_gate_read_wins() {
     // ...then the approver changes their mind. Here the step could be bypassed, so the
     // task keeps running.
     let mut fresh = reload(&store, &task).await;
+    let decision = decided(
+        &store,
+        &approval_id,
+        ApprovalStatus::Rejected,
+        Some("changed my mind"),
+    )
+    .await;
     store
-        .decide_approval(
-            &approval_id,
-            ApprovalStatus::Rejected,
-            Some("bob"),
-            Some("changed my mind"),
-            &mut fresh,
-            "bob",
-        )
+        .decide_approval(&decision, &mut fresh, "bob", None)
         .await
         .unwrap();
     let intent = trade_core::ActionIntentRecord {

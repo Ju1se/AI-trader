@@ -13,14 +13,17 @@ use serde::Deserialize;
 use serde_json::Value;
 use trade_adapters::{ChatMessage, ChatModel};
 use trade_core::{
-    ApprovalRecord, ApprovalStatus, CostEntry, GateError, IdempotencyKey, PortfolioActionPayload,
-    PreDispatchError, ReadOnlyPitView, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig,
-    UsdCents, WeightBps,
+    CostEntry, GateError, IdempotencyKey, PortfolioActionPayload, PreDispatchError,
+    ReadOnlyPitView, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, UsdCents,
+    WeightBps,
 };
 use trade_gate::{GateLedger, GateOutcome, GateRequest, run, used_up_limit};
 
-use crate::tools::{DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadRequest, is_read};
-use crate::workflow::{Harness, Step};
+use crate::tools::{
+    CreateDraft, DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadRequest, SubmitOrders,
+    is_read,
+};
+use crate::workflow::{Harness, Step, approved_request, gated};
 
 /// Event kinds of the agent's transcript in the session log.
 pub const REPLY: &str = "agent.reply";
@@ -141,27 +144,6 @@ fn describe(tool: &str, result: &Result<GateOutcome, GateError>) -> String {
     }
 }
 
-/// After a gate call the loop goes on, unless a person must now approve.
-fn after_gate(
-    tool: &str,
-    result: Result<GateOutcome, GateError>,
-) -> Result<Option<Step>, GateError> {
-    match result {
-        Ok(GateOutcome::NeedsApproval { approval_id, .. }) => Ok(Some(Step::NeedsApproval {
-            approval_id,
-            tool: tool.into(),
-        })),
-        Ok(_)
-        | Err(
-            GateError::PreDispatch(_)
-            | GateError::NotSent(_)
-            | GateError::PostDispatchUnknown { .. }
-            | GateError::Conflict(_),
-        ) => Ok(None),
-        Err(other) => Err(other),
-    }
-}
-
 impl Harness {
     /// One round of ACT with the model. `None` means the loop should look again.
     pub(crate) async fn act_with_model(
@@ -169,12 +151,13 @@ impl Harness {
         mut task: TaskRecord,
         agent: &AgentModel,
     ) -> Result<Option<Step>, GateError> {
-        let approvals = self.store.task_approvals(&task.task_id).await?;
-        if let Some(approval) = approvals
-            .iter()
-            .find(|a| a.status == ApprovalStatus::Approved)
-        {
-            return self.send_approved(&task.task_id, approval).await;
+        // What a person approved is sent exactly as approved, without asking the model again.
+        if let Some(approval) = self.approved(&task.task_id).await? {
+            let tool = approval.tool_name.clone();
+            let result = self.send(&approved_request(&approval)?, &tool).await;
+            let text = format!("Approved by a person. {}", describe(&tool, &result));
+            self.observe(&task.task_id, &text, false).await?;
+            return gated(result, &tool, false);
         }
         let contract = self.contract(&task.task_id).await?;
         let config = self.config_of(&task).await?;
@@ -227,25 +210,17 @@ impl Harness {
                         .iter()
                         .filter(|a| a.tool_name == DRAFT_TOOL)
                         .count();
-                    let as_of = contract.as_of_date.as_str();
-                    let n = drafts + 1;
-                    let request = GateRequest {
-                        task_id: id.clone(),
-                        target: format!("portfolio:{as_of}"),
-                        args: PortfolioActionPayload {
-                            draft_id: format!("DRAFT-{id}-{n}"),
-                            as_of_date: contract.as_of_date.clone(),
-                            weights_bps: weights,
-                            markets: contract.universe_markets.clone(),
-                            portfolio_capital_cents: None,
-                        },
-                        idempotency_key: IdempotencyKey::new(format!("draft:{id}:{n}")),
-                        approval_id: None,
+                    let args = PortfolioActionPayload {
+                        draft_id: format!("DRAFT-{id}-{}", drafts + 1),
+                        as_of_date: contract.as_of_date.clone(),
+                        weights_bps: weights,
+                        markets: contract.universe_markets.clone(),
+                        portfolio_capital_cents: None,
                     };
-                    let result = run(&self.store, &self.draft_tool(), &request).await;
+                    let result = self.send(&CreateDraft::request(id, args), DRAFT_TOOL).await;
                     self.observe(id, &describe(DRAFT_TOOL, &result), false)
                         .await?;
-                    after_gate(DRAFT_TOOL, result)
+                    gated(result, DRAFT_TOOL, false)
                 }
             },
             "submit_paper_orders" => {
@@ -254,24 +229,11 @@ impl Harness {
                         .refuse(id, "there is no draft yet; create one first")
                         .await;
                 };
-                let request = GateRequest {
-                    task_id: id.clone(),
-                    target: format!("paper_broker:{}", contract.as_of_date.as_str()),
-                    idempotency_key: IdempotencyKey::new(format!("order:{id}:{}", draft.draft_id)),
-                    args: PortfolioActionPayload {
-                        draft_id: draft.draft_id,
-                        as_of_date: contract.as_of_date.clone(),
-                        weights_bps: draft.weights,
-                        markets: contract.universe_markets.clone(),
-                        portfolio_capital_cents: Some(contract.portfolio_capital),
-                    },
-                    approval_id: None,
-                };
-                let result = run(&self.store, &self.order_tool(), &request).await;
-                self.record_order_cost(id, &result).await?;
+                let request = SubmitOrders::request(&contract, draft);
+                let result = self.send(&request, ORDER_TOOL).await;
                 self.observe(id, &describe(ORDER_TOOL, &result), false)
                     .await?;
-                after_gate(ORDER_TOOL, result)
+                gated(result, ORDER_TOOL, false)
             }
             "finish" => {
                 self.observe(id, "Handed to independent verification.", true)
@@ -319,7 +281,7 @@ impl Harness {
         let result = run(&self.store, &self.read_tool(name), &request).await;
         if !matches!(result, Ok(GateOutcome::Executed { .. })) {
             self.observe(id, &describe(tool, &result), false).await?;
-            return after_gate(tool, result);
+            return gated(result, tool, false);
         }
         let mut task = self.task(id).await?;
         let text = match tool {
@@ -352,36 +314,6 @@ impl Harness {
         self.observe(id, &text, false).await
     }
 
-    /// Send what a person approved, exactly as approved.
-    async fn send_approved(
-        &self,
-        task_id: &TaskId,
-        approval: &ApprovalRecord,
-    ) -> Result<Option<Step>, GateError> {
-        let args: PortfolioActionPayload = serde_json::from_str(&approval.args_json)
-            .map_err(|e| GateError::Storage(format!("corrupt_approval_args:{e}")))?;
-        let tool = approval.tool_name.as_str();
-        let request = GateRequest {
-            task_id: task_id.clone(),
-            target: approval.target.clone(),
-            args,
-            idempotency_key: IdempotencyKey::new(format!("{tool}:{}", approval.approval_id)),
-            approval_id: Some(approval.approval_id.clone()),
-        };
-        let result = match tool {
-            DRAFT_TOOL => run(&self.store, &self.draft_tool(), &request).await,
-            ORDER_TOOL => {
-                let result = run(&self.store, &self.order_tool(), &request).await;
-                self.record_order_cost(task_id, &result).await?;
-                result
-            }
-            other => return Err(GateError::Storage(format!("no_tool_for_approval:{other}"))),
-        };
-        let text = format!("Approved by a person. {}", describe(tool, &result));
-        self.observe(task_id, &text, false).await?;
-        after_gate(tool, result)
-    }
-
     /// A malformed or impossible proposal counts as a refusal, so a model that cannot
     /// follow the rules stops at the limit on refusals in a row.
     async fn refuse(&self, task_id: &TaskId, why: &str) -> Result<Option<Step>, GateError> {
@@ -401,24 +333,6 @@ impl Harness {
             .note(task_id, OBSERVATION, "harness", text, turn)
             .await?;
         Ok(None)
-    }
-
-    /// The paper broker's fee for an order that went through.
-    async fn record_order_cost(
-        &self,
-        task_id: &TaskId,
-        result: &Result<GateOutcome, GateError>,
-    ) -> Result<(), GateError> {
-        if let Ok(GateOutcome::Executed {
-            receipt_id,
-            replayed: false,
-            ..
-        }) = result
-        {
-            let cost = CostEntry::new("ACT", "broker", UsdCents::from_cents(1), receipt_id);
-            self.store.record_cost(task_id, &cost).await?;
-        }
-        Ok(())
     }
 
     async fn research_summary(&self, task_id: &TaskId) -> Result<String, GateError> {
@@ -542,6 +456,19 @@ impl Harness {
             "Research: {}.",
             if researched { "done" } else { "not done yet" }
         ));
+        if let Some(plan) = self.store.plan(&task.task_id).await? {
+            let done = self.progress(&task.task_id, &plan).await?;
+            let steps: Vec<String> = plan
+                .steps
+                .iter()
+                .map(|s| format!("{} {}", s.id, plan.status_of(s, &done).as_str()))
+                .collect();
+            status.push(format!(
+                "Plan version {}: {}.",
+                plan.version,
+                steps.join("; ")
+            ));
+        }
         match self.store.latest_draft(&task.task_id).await? {
             Some(d) => status.push(format!(
                 "Latest draft {}: {}",

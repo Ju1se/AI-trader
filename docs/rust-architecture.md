@@ -80,7 +80,7 @@ flowchart LR
 |---|---|
 | 图 4a 状态机,有环(等待和运行来回、结案后重开) | 一个枚举加一张 `match` 迁移表;环只是表里的一行,不存在节点对象 |
 | 图 0、图 1 的执行循环(提议、闸门、执行、回读、再提议) | `Harness::advance`:一个有轮数上限的循环,每轮从库里读、做一步、写回;由请求或后台任务驱动,不递归 |
-| 图 2 的计划依赖 | 还没实现(C3)。现在的任务是固定的几步;接入模型、出现多步计划时用 `Vec<PlanStep>` 加 `depends_on`,拓扑排序检查环 |
+| 图 2 的计划依赖 | `trade-core` 的 `Plan`:每一步带 `depends_on`;`Plan::new` 用拓扑排序排好顺序,步骤重名、依赖不存在、有环都拒绝。步骤是不是做完不存在计划里,按库里的事实算。模板写在任务类型配置里,FRAME 时存第 1 版;有人否决一个可以跳过的步骤,就存去掉这一步的新版本 |
 | 图 2 的分派(主 Agent 和 worker) | 任务书和结果都是值;专家只拿到只读视图,彼此不共享可变状态 |
 | 图 3b 批准(任务等批准,批准指回任务) | 两张表用 ID 互相指向;「消耗批准」「登记已发出」「更新任务」在同一个数据库事务里完成 |
 | 图 8 的一对多、多对一 | 外键加查询;Rust 里没有双向指针 |
@@ -199,7 +199,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 |---|---|---|
 | 图 0 总体活动图 | `server/src/workflow.rs`:`admit`、`frame`、`advance`、`close`、`confirm_settlement` | `tests/workflow.rs` 的 `full_run_completes_and_a_reopened_task_counts_once` |
 | 图 1 职责泳道 | crate 边界本身;`gate::run` 的顺序;`VerifiedGateTicket` | 依赖方向由 Cargo 保证 |
-| 图 2 定义阶段 | `Harness::frame` 定合约或提问;研究阶段专家只拿只读视图 | `ambiguous_request_waits_for_an_answer_then_goes_to_a_person`;计划依赖未实现 |
+| 图 2 定义阶段 | `Harness::frame` 定合约或提问,并存计划第 1 版;闸门第 5 道拒绝没就绪或已跳过的步骤,固定规则和模型两条路都受它约束;研究阶段专家只拿只读视图 | `ambiguous_request_waits_for_an_answer_then_goes_to_a_person`、`the_plan_orders_the_steps_and_a_refused_step_stays_dropped`、`refused_orders_are_skipped_and_the_draft_delivered_as_partial`;`plan.rs` 的拓扑排序和环检测有属性测试 |
 | 图 3a 闸门 | `gate::decide` | `refusals_follow_diagram_3a_in_order` 等 4 个表驱动测试 |
 | 图 3b 批准 | store 的批准表和事务;`Harness::decide_approval`(绕开或被否决) | `approval_is_used_once_for_exactly_its_payload`、`a_rejection_after_the_gate_read_wins`、`refused_orders_are_skipped_and_the_draft_delivered_as_partial`、`refusing_a_required_step_declines_the_task` |
 | 图 4a 状态机 | `core/src/state.rs` 的迁移表;store 带版本号的更新 | `transition_table_matches_diagram_4a_exactly`、`random_walks_keep_diagram_invariants`、`stale_copy_cannot_overwrite_a_newer_write` |
@@ -236,7 +236,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 |---|---|---|
 | C1 | 迁移表和图 4a 有 5 处出入 | 已完成,测试逐条比对 13×13 |
 | C2 | 批准被否决时一律转被否决 | 已完成:不可逆的一步(R3)在合约允许时可以绕开,回到运行中、交付已完成的部分;否则 `DECLINED`。过期同样处理 |
-| C3 | 计划依赖还没有 | 推迟。现在的任务只有固定的几步,没有计划可查;接入模型后再做 |
+| C3 | 计划依赖还没有 | 已完成:`Plan`、`plans` 表(`migrations/0002_plans.sql`)、任务类型里的 `[[plan]]` 模板。原来「下一步做什么」散在 11 处,现在由计划决定;下单被否决、跳过之后,模型再提下单会被闸门拒绝,不会再建批准请求 |
 | C4 | 未来一个月的收益会交给专家 | 已完成:快照类型里没有这个字段,回测通过 `get_forward_returns` 单独拿 |
 
 ### 8.4 高频试错
@@ -280,7 +280,7 @@ pub fn decide<T: Tool>(tool: &T, req: &GateRequest<T::Args>, ctx: &GateContext, 
 
 ### 8.8 还没做的
 
-- C3 计划依赖;OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
+- OpenAPI 文件;真实登录和角色;加额度的接口;多实例下的对账租约。
 - 用模型当专家(现在模型只做主 Agent 的提议);由后台任务自动推进 `advance`。
 
 ## 9. 里程碑

@@ -41,6 +41,7 @@ fn config(autonomy: AutonomyLevel) -> TaskTypeConfig {
         budget_limits: BudgetLimits::default(),
         done_criteria: vec!["ok".into()],
         waits: Default::default(),
+        plan: Vec::new(),
     }
 }
 

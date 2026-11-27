@@ -9,6 +9,7 @@ use trade_core::{
     PortfolioActionPayload, PreDispatchError, WeightBps,
 };
 use trade_gate::{GateRequest, run};
+use trade_server::tools::SubmitOrders;
 use trade_server::{DRAFT_TOOL, Framing, ORDER_TOOL, PAPER_BROKER_KEY, Step};
 
 fn state(task: &trade_core::TaskRecord) -> &'static str {
@@ -138,6 +139,10 @@ async fn refused_orders_are_skipped_and_the_draft_delivered_as_partial() {
             .contains(&"orders_not_placed:approval_refused".to_string())
     );
     assert_eq!(h.broker.count_orders_for_task(&task), 0);
+    // REPLAN: version 2 drops the refused step; version 1 had it.
+    let plan = h.store.plan(&task).await.unwrap().unwrap();
+    assert_eq!(plan.version, 2);
+    assert!(plan.step("orders").unwrap().skipped);
 }
 
 /// C2: refusing a step that cannot be skipped ends the task as DECLINED.
@@ -299,16 +304,11 @@ async fn a_restart_settles_what_a_crash_left_in_flight() {
         .unwrap();
     // The process sends the order and dies before it hears back.
     broker.inject_next_fault(BrokerFault::TimeoutAfterFill);
-    let (payload, _) = before.proposal(&task).await.unwrap();
+    let contract = before.store.contract(&task).await.unwrap().unwrap();
+    let draft = before.store.latest_draft(&task).await.unwrap().unwrap();
     let request = GateRequest {
-        task_id: task.clone(),
-        target: "paper_broker:2026-02-10".into(),
-        args: PortfolioActionPayload {
-            portfolio_capital_cents: Some(trade_core::UsdCents::from_dollars(1_000_000.0)),
-            ..payload
-        },
-        idempotency_key: IdempotencyKey::new(format!("order:{task}:2026-02-10")),
         approval_id: Some(approval_id),
+        ..SubmitOrders::request(&contract, draft)
     };
     let err = run(&before.store, &before.order_tool(), &request)
         .await

@@ -12,9 +12,9 @@ use trade_adapters::{FixtureMarket, PaperBroker};
 use trade_core::{
     ActionIntentRecord, ActionIntentStatus, AgentEvidenceOutput, ApprovalId, ApprovalRecord,
     ApprovalStatus, AsOfDate, Completeness, CostEntry, DeliveryManifest, GateError, HandoffPackage,
-    IdempotencyKey, PitMarketSource, PitSecuritySnapshot, PortfolioActionPayload, PreDispatchError,
-    RiskTier, TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction,
-    TransitionError, UsdCents, WaitMetadata, sha256_hex,
+    PitMarketSource, PitSecuritySnapshot, Plan, PortfolioActionPayload, PreDispatchError, RiskTier,
+    TaskContract, TaskId, TaskRecord, TaskState, TaskTypeConfig, TimeoutAction, TransitionError,
+    UsdCents, WaitMetadata, sha256_hex,
 };
 use trade_gate::{DispatchResult, GateOutcome, GateRequest, run};
 use trade_quant::{QuantSecurityResult, score_pit_universe};
@@ -25,7 +25,7 @@ use crate::agent::AgentModel;
 use crate::config::Strategy;
 use crate::tools::{
     CreateDraft, DRAFT_TOOL, ORDER_TOOL, READ_FILINGS, READ_MARKET, ReadPit, SubmitOrders,
-    limit_breaches,
+    action_key, done_steps, limit_breaches,
 };
 
 /// The task type this harness runs.
@@ -412,6 +412,8 @@ impl Harness {
             irreversible_steps_deferred: req.orders_optional,
         };
         self.store.save_contract(&contract).await?;
+        let plan = new_plan(&config, &contract)?;
+        self.store.save_plan(&task.task_id, &plan, "framed").await?;
         self.store
             .save(&mut task, "contract_pinned", "frame")
             .await?;
@@ -455,71 +457,96 @@ impl Harness {
     /// One round of ACT: research once, then the draft, then the orders, then CLOSE.
     /// `None` means something changed and the loop should look again.
     async fn act(&self, mut task: TaskRecord) -> Result<Option<Step>, GateError> {
+        if let Some(approval) = self.approved(&task.task_id).await? {
+            let tool = approval.tool_name.clone();
+            let result = self.send(&approved_request(&approval)?, &tool).await;
+            return gated(result, &tool, true);
+        }
         let contract = self.contract(&task.task_id).await?;
-        if self.store.evaluations(&task.task_id).await?.is_empty() {
-            self.research(&mut task, &contract).await?;
-            return Ok(None);
-        }
-        let actions = self.store.actions(&task.task_id).await?;
-        let done = |tool: &str| {
-            actions
-                .iter()
-                .any(|a| a.tool_name == tool && a.status == ActionIntentStatus::Verified)
+        let plan = self.plan_of(&task, &contract).await?;
+        let done = self.progress(&task.task_id, &plan).await?;
+        let Some(step) = plan.next_ready(&done) else {
+            return self.close(task).await;
         };
-        let approvals = self.store.task_approvals(&task.task_id).await?;
-        let approved = |tool: &str| {
-            approvals
-                .iter()
-                .find(|a| a.tool_name == tool && a.status == ApprovalStatus::Approved)
-                .map(|a| a.approval_id.clone())
-        };
-        let as_of = contract.as_of_date.as_str();
-
-        if !done(DRAFT_TOOL) {
-            let request = GateRequest {
-                task_id: task.task_id.clone(),
-                target: format!("portfolio:{as_of}"),
-                args: self.proposal(&task.task_id).await?.0,
-                idempotency_key: IdempotencyKey::new(format!("draft:{}:{as_of}", task.task_id)),
-                approval_id: approved(DRAFT_TOOL),
-            };
-            return gated(
-                run(&self.store, &self.draft_tool(), &request).await,
-                DRAFT_TOOL,
-            );
-        }
-        if !done(ORDER_TOOL) && !refused(&approvals, ORDER_TOOL) {
-            let draft = self
-                .store
-                .latest_draft(&task.task_id)
-                .await?
-                .ok_or_else(|| GateError::not_found("draft", &task.task_id))?;
-            let request = GateRequest {
-                task_id: task.task_id.clone(),
-                target: format!("paper_broker:{as_of}"),
-                args: PortfolioActionPayload {
-                    draft_id: draft.draft_id,
-                    as_of_date: contract.as_of_date.clone(),
-                    weights_bps: draft.weights,
-                    markets: contract.universe_markets.clone(),
-                    portfolio_capital_cents: Some(contract.portfolio_capital),
-                },
-                idempotency_key: IdempotencyKey::new(format!("order:{}:{as_of}", task.task_id)),
-                approval_id: approved(ORDER_TOOL),
-            };
-            let result = run(&self.store, &self.order_tool(), &request).await;
-            if let Ok(GateOutcome::Executed {
-                receipt_id,
-                replayed: false,
-                ..
-            }) = &result
-            {
-                let cost = CostEntry::new("ACT", "broker", UsdCents::from_cents(1), receipt_id);
-                self.store.record_cost(&task.task_id, &cost).await?;
+        let request = match step.tool.as_str() {
+            DRAFT_TOOL => {
+                CreateDraft::request(&task.task_id, self.proposal(&task.task_id).await?.0)
             }
-            return gated(result, ORDER_TOOL);
+            ORDER_TOOL => {
+                let draft = self.store.latest_draft(&task.task_id).await?;
+                SubmitOrders::request(
+                    &contract,
+                    draft.ok_or_else(|| GateError::not_found("draft", &task.task_id))?,
+                )
+            }
+            // The research step: the fixed rules read and score the universe themselves.
+            _ => {
+                self.research(&mut task, &contract).await?;
+                return Ok(None);
+            }
+        };
+        gated(self.send(&request, &step.tool).await, &step.tool, true)
+    }
+
+    /// The plan in force. A task framed before plans existed gets its version 1 now.
+    pub(crate) async fn plan_of(
+        &self,
+        task: &TaskRecord,
+        contract: &TaskContract,
+    ) -> Result<Plan, GateError> {
+        if let Some(plan) = self.store.plan(&task.task_id).await? {
+            return Ok(plan);
         }
-        self.close(task).await
+        let plan = new_plan(&self.config_of(task).await?, contract)?;
+        self.store.save_plan(&task.task_id, &plan, "framed").await?;
+        Ok(plan)
+    }
+
+    /// The steps of `plan` already done, from stored facts.
+    pub(crate) async fn progress(
+        &self,
+        task_id: &TaskId,
+        plan: &Plan,
+    ) -> Result<BTreeSet<String>, GateError> {
+        let researched = !self.store.evaluations(task_id).await?.is_empty();
+        Ok(done_steps(
+            plan,
+            researched,
+            &self.store.actions(task_id).await?,
+        ))
+    }
+
+    /// The approval a person gave and the gate has not used yet, if any.
+    pub(crate) async fn approved(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<ApprovalRecord>, GateError> {
+        let approvals = self.store.task_approvals(task_id).await?;
+        Ok(approvals
+            .into_iter()
+            .find(|a| a.status == ApprovalStatus::Approved))
+    }
+
+    /// A write through the gate. A fresh broker fill also books its cost.
+    pub(crate) async fn send(
+        &self,
+        request: &GateRequest<PortfolioActionPayload>,
+        tool: &str,
+    ) -> Result<GateOutcome, GateError> {
+        if tool != ORDER_TOOL {
+            return run(&self.store, &self.draft_tool(), request).await;
+        }
+        let result = run(&self.store, &self.order_tool(), request).await;
+        if let Ok(GateOutcome::Executed {
+            receipt_id,
+            replayed: false,
+            ..
+        }) = &result
+        {
+            let cost = CostEntry::new("ACT", "broker", UsdCents::from_cents(1), receipt_id);
+            self.store.record_cost(&request.task_id, &cost).await?;
+        }
+        result
     }
 
     /// The quant screen on the contract's date: what was public then, scored. Pure and
@@ -652,22 +679,21 @@ impl Harness {
             return self.hand_off(&task.task_id, &reason).await.map(Some);
         }
 
-        let actions = self.store.actions(&task.task_id).await?;
-        let orders_placed = actions
-            .iter()
-            .any(|a| a.tool_name == ORDER_TOOL && a.status == ActionIntentStatus::Verified);
-        if !orders_placed {
-            let approvals = self.store.task_approvals(&task.task_id).await?;
-            check.gaps.push(if refused(&approvals, ORDER_TOOL) {
-                "orders_not_placed:approval_refused".into()
+        // Every step of the plan not done is a gap; one a person refused says so.
+        let plan = self.plan_of(&task, &contract).await?;
+        let done = self.progress(&task.task_id, &plan).await?;
+        for step in plan.steps.iter().filter(|s| !done.contains(&s.id)) {
+            check.gaps.push(if step.skipped {
+                format!("{}_not_placed:approval_refused", step.id)
             } else {
-                "orders_not_placed".into()
+                format!("{}_not_placed", step.id)
             });
         }
+        let all_done = done.len() == plan.steps.len();
         if let Some(limit) = &from_limit {
             check.gaps.push(format!("stopped_by_limit:{limit}"));
         }
-        let completeness = if orders_placed && from_limit.is_none() {
+        let completeness = if all_done && from_limit.is_none() {
             Completeness::Complete
         } else {
             Completeness::Partial
@@ -822,15 +848,8 @@ impl Harness {
             (true, false) => ApprovalStatus::Approved,
             (false, false) => ApprovalStatus::Rejected,
         };
-        self.settle_approval(
-            &mut task,
-            &approval,
-            status,
-            Some(approver_id),
-            note,
-            &config,
-        )
-        .await?;
+        self.settle_approval(&mut task, &approval, status, Some(approver_id), note)
+            .await?;
         if expired {
             return Err(PreDispatchError::ApprovalExpired(approval_id.to_string()).into());
         }
@@ -844,14 +863,18 @@ impl Harness {
         status: ApprovalStatus,
         approver_id: Option<&str>,
         note: Option<&str>,
-        config: &TaskTypeConfig,
     ) -> Result<(), GateError> {
-        let skippable = config.lookup_tool_risk(&approval.tool_name) == Some(RiskTier::R3)
-            && self
-                .contract(&task.task_id)
-                .await?
-                .irreversible_steps_deferred;
-        let next = if status == ApprovalStatus::Approved || skippable {
+        // REPLAN (Diagram 2): a refused step the plan may skip is dropped in a new version,
+        // and the task goes on without it; any other refusal ends the task as DECLINED.
+        let plan = self
+            .plan_of(task, &self.contract(&task.task_id).await?)
+            .await?;
+        let step = plan.for_tool(&approval.tool_name).filter(|s| s.skippable);
+        let replan = match step {
+            Some(s) if status != ApprovalStatus::Approved => Some(plan.skip(&s.id)?),
+            _ => None,
+        };
+        let next = if status == ApprovalStatus::Approved || step.is_some() {
             TaskState::Running
         } else {
             TaskState::Declined {
@@ -863,15 +886,15 @@ impl Harness {
             }
         };
         task.transition(next, self.store.now())?;
+        let decision = ApprovalRecord {
+            status,
+            approver_id: approver_id.map(str::to_string),
+            decision_note: note.map(str::to_string),
+            ..approval.clone()
+        };
+        let actor = approver_id.unwrap_or("sweeper");
         self.store
-            .decide_approval(
-                &approval.approval_id,
-                status,
-                approver_id,
-                note,
-                task,
-                approver_id.unwrap_or("sweeper"),
-            )
+            .decide_approval(&decision, task, actor, replan.as_ref())
             .await
     }
 
@@ -1078,7 +1101,6 @@ impl Harness {
                             ApprovalStatus::Expired,
                             None,
                             note,
-                            &config,
                         )
                         .await?;
                     }
@@ -1160,29 +1182,65 @@ impl Harness {
     }
 }
 
-fn refused(approvals: &[ApprovalRecord], tool: &str) -> bool {
-    approvals.iter().any(|a| {
-        a.tool_name == tool
-            && matches!(a.status, ApprovalStatus::Rejected | ApprovalStatus::Expired)
-    })
-}
-
-/// What a gate result means for the loop: carry on, stop for a person, or report a denial.
-fn gated(result: Result<GateOutcome, GateError>, tool: &str) -> Result<Option<Step>, GateError> {
+/// What a gate result means for the loop: carry on, stop for a person, or, for the fixed
+/// rules, report a denial (the model is told it and proposes again instead).
+pub(crate) fn gated(
+    result: Result<GateOutcome, GateError>,
+    tool: &str,
+    report_denials: bool,
+) -> Result<Option<Step>, GateError> {
     match result {
         Ok(GateOutcome::Executed { .. }) => Ok(None),
         Ok(GateOutcome::NeedsApproval { approval_id, .. }) => Ok(Some(Step::NeedsApproval {
             approval_id,
             tool: tool.into(),
         })),
-        // The gate moved the task to LIMIT_REACHED; the next round closes it.
+        // The gate moved the task to LIMIT_REACHED; the next round handles it.
         Err(GateError::PreDispatch(PreDispatchError::LimitReached(_))) => Ok(None),
-        Err(GateError::PreDispatch(reason)) => Ok(Some(Step::Denied(reason.code()))),
+        Err(GateError::PreDispatch(reason)) if report_denials => {
+            Ok(Some(Step::Denied(reason.code())))
+        }
         // Not sent: the next round retries, within the retry limit. Unknown outcome: the
         // next round reconciles. Conflict: the next round reads again.
         Err(
-            GateError::NotSent(_) | GateError::PostDispatchUnknown { .. } | GateError::Conflict(_),
+            GateError::PreDispatch(_)
+            | GateError::NotSent(_)
+            | GateError::PostDispatchUnknown { .. }
+            | GateError::Conflict(_),
         ) => Ok(None),
         Err(other) => Err(other),
     }
+}
+
+/// Version 1 of a task's plan from its type's template. An R3 step may be skipped when the
+/// contract lets a person do it instead.
+fn new_plan(config: &TaskTypeConfig, contract: &TaskContract) -> Result<Plan, GateError> {
+    let steps = config
+        .plan
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.skippable = config.lookup_tool_risk(&s.tool) == Some(RiskTier::R3)
+                && contract.irreversible_steps_deferred;
+            s.skipped = false;
+            s
+        })
+        .collect();
+    Ok(Plan::new(steps)?)
+}
+
+/// What a person approved, ready to send exactly as approved, under the key the proposal
+/// had.
+pub(crate) fn approved_request(
+    approval: &ApprovalRecord,
+) -> Result<GateRequest<PortfolioActionPayload>, GateError> {
+    let args: PortfolioActionPayload = serde_json::from_str(&approval.args_json)
+        .map_err(|e| GateError::Storage(format!("corrupt_approval_args:{e}")))?;
+    Ok(GateRequest {
+        task_id: approval.task_id.clone(),
+        target: approval.target.clone(),
+        idempotency_key: action_key(&approval.tool_name, &args),
+        args,
+        approval_id: Some(approval.approval_id.clone()),
+    })
 }

@@ -28,4 +28,4 @@ Tools:
 6. finish {"note": "<what you did>"}
    You are done. The harness then verifies the work independently. If it finds gaps, you will be told and can fix them.
 
-Work in this order: research, create_rebalance_draft, submit_paper_orders, finish. If a proposal is refused, read the reason and change the proposal. Never repeat a refused proposal unchanged.
+Work in this order: research, create_rebalance_draft, submit_paper_orders, finish. The status shows the task's plan: each step is done, ready, blocked or skipped. A skipped step was refused by a person: never propose it again. If a proposal is refused, read the reason and change the proposal. Never repeat a refused proposal unchanged.

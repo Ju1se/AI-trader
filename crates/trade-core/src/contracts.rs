@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ApprovalId, IdempotencyKey, TaskId};
+use crate::plan::{Plan, PlanStep};
 use crate::types::{
     AsOfDate, FilingDate, PeriodEndDate, SchemaError, UsdCents, WeightBps, require_non_empty,
 };
@@ -144,6 +145,11 @@ pub struct TaskTypeConfig {
     pub done_criteria: Vec<String>,
     #[serde(default)]
     pub waits: WaitPolicy,
+    /// Diagram 2: the steps of a task of this type and what each waits for. Every new task's
+    /// plan starts from it. Checked at start-up: a cycle, an unknown step or a tool that is
+    /// not allowed stops the server.
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
 }
 
 /// How long each kind of wait may last, and who takes over when nobody acts.
@@ -182,6 +188,17 @@ impl TaskTypeConfig {
         if self.done_criteria.is_empty() {
             return Err(SchemaError("done_criteria must not be empty".into()));
         }
+        if let Some(step) = self
+            .plan
+            .iter()
+            .find(|s| !self.allowed_tools.contains_key(&s.tool))
+        {
+            return Err(SchemaError(format!(
+                "plan_step_{}_tool_not_allowed",
+                step.id
+            )));
+        }
+        Plan::new(self.plan.clone())?;
         self.budget_limits.validate()
     }
 

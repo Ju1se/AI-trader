@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 use trade_adapters::{BrokerOrderReceipt, FixtureMarket, PaperBroker};
 use trade_core::{
-    ActionIntentRecord, ExecError, GateError, IdempotencyKey, PitMarketSource, PitSecuritySnapshot,
-    PortfolioActionPayload, PreDispatchError, RiskTier, StoredDraft, TaskContract, TaskId,
-    TaskRecord, UsdCents, WeightBps,
+    ActionIntentRecord, ActionIntentStatus, ExecError, GateError, IdempotencyKey, PitMarketSource,
+    PitSecuritySnapshot, Plan, PortfolioActionPayload, PreDispatchError, RiskTier, StepStatus,
+    StoredDraft, TaskContract, TaskId, TaskRecord, UsdCents, WeightBps,
 };
-use trade_gate::{DispatchResult, Tool, VerifiedGateTicket};
+use trade_gate::{DispatchResult, GateRequest, Tool, VerifiedGateTicket};
 use trade_research::InvestmentCommittee;
 use trade_store::Store;
 
@@ -41,6 +41,60 @@ pub struct PortfolioFacts {
     pub universe: Vec<PitSecuritySnapshot>,
     /// The stored draft the orders must match. Read only for orders.
     pub draft: Option<StoredDraft>,
+    /// The plan in force and the steps already done, which decide whether a write may run.
+    pub plan: Option<Plan>,
+    pub done: BTreeSet<String>,
+}
+
+/// The plan steps already done, worked out from stored facts: a read step once research
+/// results are stored, any other once an action of its tool is verified.
+pub fn done_steps(
+    plan: &Plan,
+    researched: bool,
+    actions: &[ActionIntentRecord],
+) -> BTreeSet<String> {
+    let verified = |tool: &str| {
+        actions
+            .iter()
+            .any(|a| a.tool_name == tool && a.status == ActionIntentStatus::Verified)
+    };
+    plan.steps
+        .iter()
+        .filter(|s| {
+            if is_read(&s.tool) {
+                researched
+            } else {
+                verified(&s.tool)
+            }
+        })
+        .map(|s| s.id.clone())
+        .collect()
+}
+
+/// Diagram 2: a write runs only when its step of the plan is ready, and never once a person
+/// refused the step. A tool outside the plan is not ordered by it.
+fn check_step(tool: &str, facts: &PortfolioFacts) -> Result<(), PreDispatchError> {
+    use PreDispatchError::BusinessRuleViolation as Rule;
+    let Some(plan) = &facts.plan else {
+        return Ok(());
+    };
+    let Some(step) = plan.for_tool(tool) else {
+        return Ok(());
+    };
+    match plan.status_of(step, &facts.done) {
+        StepStatus::Skipped => Err(Rule(format!("step_skipped:{}", step.id))),
+        StepStatus::Blocked => Err(Rule(format!(
+            "step_waits_for:{}",
+            plan.waiting_for(step, &facts.done).join(",")
+        ))),
+        StepStatus::Ready | StepStatus::Done => Ok(()),
+    }
+}
+
+/// One idempotency key per write: the tool and the draft it is about. It is rebuilt from
+/// the payload alone, so sending what a person approved repeats the very same action.
+pub fn action_key(tool: &str, args: &PortfolioActionPayload) -> IdempotencyKey {
+    IdempotencyKey::new(format!("{tool}:{}", args.draft_id))
 }
 
 /// Each way `weights` breaks the strategy's portfolio limits, given the market data of the
@@ -111,6 +165,12 @@ async fn load_portfolio_facts(
         Some(id) => store.draft(id).await?,
         None => None,
     };
+    let plan = store.plan(&task.task_id).await?;
+    let actions = store.actions(&task.task_id).await?;
+    let done = plan
+        .as_ref()
+        .map(|p| done_steps(p, !decisions.is_empty(), &actions))
+        .unwrap_or_default();
     Ok(PortfolioFacts {
         evaluated: decisions.iter().map(|d| d.ticker.clone()).collect(),
         vetoed: decisions
@@ -121,6 +181,8 @@ async fn load_portfolio_facts(
         contract,
         universe,
         draft,
+        plan,
+        done,
     })
 }
 
@@ -154,9 +216,6 @@ fn check_portfolio(
         .any(|w| w.bps() > MAX_POSITION_BPS)
     {
         return Err(Rule("single_position_exceeds_45pct_cap".into()));
-    }
-    if facts.evaluated.is_empty() {
-        return Err(Rule("missing_db_security_evaluations".into()));
     }
     for ticker in args.weights_bps.keys() {
         if !facts.evaluated.contains(ticker) {
@@ -275,6 +334,20 @@ pub struct CreateDraft {
 }
 
 impl CreateDraft {
+    /// The request that writes `args` as the task's draft.
+    pub fn request(
+        task_id: &TaskId,
+        args: PortfolioActionPayload,
+    ) -> GateRequest<PortfolioActionPayload> {
+        GateRequest {
+            task_id: task_id.clone(),
+            target: format!("portfolio:{}", args.as_of_date.as_str()),
+            idempotency_key: action_key(DRAFT_TOOL, &args),
+            args,
+            approval_id: None,
+        }
+    }
+
     fn matches(draft: &StoredDraft, task_id: &TaskId, args: &PortfolioActionPayload) -> bool {
         &draft.task_id == task_id
             && draft.as_of_date == args.as_of_date
@@ -332,6 +405,7 @@ impl Tool for CreateDraft {
         task: &TaskRecord,
         facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
+        check_step(DRAFT_TOOL, facts)?;
         check_portfolio(args, task, facts, &self.committee)
     }
 
@@ -370,6 +444,28 @@ pub struct SubmitOrders {
 }
 
 impl SubmitOrders {
+    /// The request that places orders for `draft`, exactly as drafted, with the contract's
+    /// capital.
+    pub fn request(
+        contract: &TaskContract,
+        draft: StoredDraft,
+    ) -> GateRequest<PortfolioActionPayload> {
+        let args = PortfolioActionPayload {
+            draft_id: draft.draft_id,
+            as_of_date: contract.as_of_date.clone(),
+            weights_bps: draft.weights,
+            markets: contract.universe_markets.clone(),
+            portfolio_capital_cents: Some(contract.portfolio_capital),
+        };
+        GateRequest {
+            task_id: contract.task_id.clone(),
+            target: format!("paper_broker:{}", contract.as_of_date.as_str()),
+            idempotency_key: action_key(ORDER_TOOL, &args),
+            args,
+            approval_id: None,
+        }
+    }
+
     /// The broker shows exactly the requested orders: same tickers, weights and amounts.
     fn matches(receipt: &BrokerOrderReceipt, args: &PortfolioActionPayload) -> Result<(), String> {
         if receipt.status != "FILLED" {
@@ -468,6 +564,7 @@ impl Tool for SubmitOrders {
         task: &TaskRecord,
         facts: &Self::Facts,
     ) -> Result<(), PreDispatchError> {
+        check_step(ORDER_TOOL, facts)?;
         check_portfolio(args, task, facts, &self.committee)?;
         if args.portfolio_capital_cents.is_none_or(|c| c.cents() <= 0) {
             return Err(PreDispatchError::InvalidArguments(

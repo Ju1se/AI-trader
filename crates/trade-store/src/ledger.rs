@@ -4,12 +4,12 @@ use sqlx::AnyConnection;
 use sqlx::FromRow;
 use trade_core::{
     ActionIntentRecord, ActionIntentStatus, ApprovalId, ApprovalRecord, ApprovalStatus, GateError,
-    IdempotencyKey, PreDispatchError, TaskId, TaskRecord,
+    IdempotencyKey, Plan, PreDispatchError, TaskId, TaskRecord,
 };
 use trade_gate::{DispatchResult, GateContext, GateLedger, NewApproval};
 
-use crate::tasks::commit_task;
 use crate::tasks::{UNSETTLED, save_in, task_in, task_type_in, unsettled_action_in};
+use crate::tasks::{commit_task, insert_plan_in};
 use crate::{Change, Fact, Store, all, db, new_id};
 
 #[derive(FromRow)]
@@ -349,15 +349,17 @@ impl Store {
     /// pending approval can be approved, rejected or expired; an approved one that was not
     /// used yet can still be revoked (rejected) or expire. Nothing past its deadline can be
     /// approved.
+    ///
+    /// `decision` is the approval with its new status, approver and note. A refusal the
+    /// task goes on without also stores `replan`, the plan's next version.
     pub async fn decide_approval(
         &self,
-        id: &ApprovalId,
-        status: ApprovalStatus,
-        approver_id: Option<&str>,
-        note: Option<&str>,
+        decision: &ApprovalRecord,
         task: &mut TaskRecord,
         actor: &str,
+        replan: Option<&Plan>,
     ) -> Result<(), GateError> {
+        let (id, status) = (&decision.approval_id, decision.status);
         let now = self.now();
         let mut tx = self.begin().await?;
         let decided = sqlx::query(
@@ -368,8 +370,8 @@ impl Store {
                AND ($1 <> 'APPROVED' OR expires_at_epoch_s > $4)",
         )
         .bind(status.as_str())
-        .bind(approver_id)
-        .bind(note)
+        .bind(decision.approver_id.as_deref())
+        .bind(decision.decision_note.as_deref())
         .bind(now)
         .bind(id.as_str())
         .bind(task.task_id.as_str())
@@ -380,6 +382,10 @@ impl Store {
             return Err(GateError::Conflict(format!(
                 "approval {id} cannot take this decision"
             )));
+        }
+        if let Some(plan) = replan {
+            let reason = format!("approval_{}:{id}", status.as_str().to_lowercase());
+            insert_plan_in(&mut tx, &task.task_id, plan, &reason, now).await?;
         }
         let change = Change::new("approval_decided", actor, status.as_str()).about(id);
         commit_task(tx, task, &change, now).await

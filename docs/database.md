@@ -33,7 +33,7 @@
 | `agent_calibration` | (学习) | 每个专家的可信度 | 主键 `agent_name` |
 | `curated_memory` | (学习) | 结案后整理的经验,等人审核 | 主键 `memory_id` |
 
-图 8 里的 PLAN(计划和步骤依赖)还没有表,等接入模型、出现多步计划时再加。
+图 8 里的 PLAN 在 `plans` 表(`migrations/0002_plans.sql`):任务计划的每一个版本都留着,最新的是现行的。
 
 ## 几个关键设计
 

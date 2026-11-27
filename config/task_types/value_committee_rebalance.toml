@@ -3,7 +3,7 @@
 # `version`. Tasks keep the version they started with.
 
 task_type = "value_committee_rebalance"
-version = "3.1.0"
+version = "3.2.0"
 shape_level = "MultiAgent"
 shape_rationale = "A deterministic factor screen ranks the whole point-in-time universe; read-only specialists and an investment committee review the candidates."
 autonomy_level = "PerActionApproval"
@@ -42,3 +42,20 @@ handoff_ack_ttl_s = 14_400 # 4 h for the new owner to take over, then the next o
 approver_role = "portfolio_approver"
 escalation_owner_id = "risk_committee_lead"
 backup_owner_id = "operations_on_call"
+
+# Diagram 2: the steps, and what each waits for. Irreversible steps come after the checks
+# and approvals they depend on. Whether a step may be skipped is decided at FRAME: an R3
+# step is skippable when the contract lets a person do it instead.
+[[plan]]
+id = "research"
+tool = "read_pit_market"
+
+[[plan]]
+id = "draft"
+tool = "create_rebalance_draft"
+depends_on = ["research"]
+
+[[plan]]
+id = "orders"
+tool = "submit_paper_orders"
+depends_on = ["draft"]

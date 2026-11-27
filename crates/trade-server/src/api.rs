@@ -435,6 +435,26 @@ async fn detail(h: &Harness, id: &TaskId) -> ApiResult<Value> {
     let mut view = task_view(&task);
     view["open_questions"] = json!(questions);
     view["contract"] = json!(h.store.contract(id).await?);
+    view["plan"] = match h.store.plan(id).await? {
+        Some(plan) => {
+            let done = h.progress(id, &plan).await?;
+            let steps: Vec<Value> = plan
+                .steps
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "tool": s.tool,
+                        "depends_on": s.depends_on,
+                        "skippable": s.skippable,
+                        "status": plan.status_of(s, &done).as_str(),
+                    })
+                })
+                .collect();
+            json!({"version": plan.version, "steps": steps})
+        }
+        None => Value::Null,
+    };
     view["approvals"] = json!(approvals);
     view["draft"] = json!(h.store.latest_draft(id).await?);
     view["delivery"] = json!(h.store.delivery(id).await?);
