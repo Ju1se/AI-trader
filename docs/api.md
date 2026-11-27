@@ -134,7 +134,7 @@ cargo run -p trade-server --bin trade -- serve --dev --db trade.db
 {
   "id": "TASK-40f4d4b068",
   "task_type": "value_committee_rebalance",
-  "config_version": "3.0.0",
+  "config_version": "3.1.0",
   "state": "AWAITING_APPROVAL",
   "state_label": "等批准",
   "owner_role": "approver",

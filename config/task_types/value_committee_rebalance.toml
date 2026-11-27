@@ -3,7 +3,7 @@
 # `version`. Tasks keep the version they started with.
 
 task_type = "value_committee_rebalance"
-version = "3.0.0"
+version = "3.1.0"
 shape_level = "MultiAgent"
 shape_rationale = "A deterministic factor screen ranks the whole point-in-time universe; read-only specialists and an investment committee review the candidates."
 autonomy_level = "PerActionApproval"
@@ -28,7 +28,8 @@ direct_wire_transfer = "R4"
 max_turns = 50
 max_spend = 500           # cents
 reserved_close_spend = 25 # cents kept back for verifying and delivering
-max_wall_ms = 120_000     # working time since the task last started running
+max_wall_ms = 1_800_000   # working time since the task last started running; a local model
+                          # can take minutes per reply
 max_retries = 3
 max_consecutive_denials = 6
 max_reworks = 2
