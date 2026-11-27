@@ -1,5 +1,5 @@
 [package]
-name = "trade-cli"
+name = "trade-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,11 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 trade-core = { path = "../trade-core" }
 trade-quant = { path = "../trade-quant" }
-trade-workers = { path = "../trade-workers" }
+trade-research = { path = "../trade-research" }
 trade-gate = { path = "../trade-gate" }
-trade-broker = { path = "../trade-broker" }
+trade-adapters = { path = "../trade-adapters" }
 trade-store = { path = "../trade-store" }
+
+[[bin]]
+name = "trade"
+path = "src/main.rs"

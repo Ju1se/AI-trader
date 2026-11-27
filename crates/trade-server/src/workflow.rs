@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use trade_broker::PaperBrokerAdapter;
+use trade_adapters::PaperBrokerAdapter;
 use trade_core::{
     sha256_hex, ActionIntentStatus, AutonomyLevel, BudgetLimits, CommitteeDecision, Completeness,
     DeliveryManifest, GateError, HandoffPackage, PhaseCompleted, PhaseFramed, PhaseQueued,
@@ -17,7 +17,7 @@ use trade_core::{
 use trade_gate::{ActionGate, GateLedger, GateOutcome};
 use trade_quant::{score_pit_universe, QuantSecurityResult};
 use trade_store::DbStore;
-use trade_workers::{
+use trade_research::{
     FootnoteForensicsWorker, InvestmentCommittee, LlmJsonReasoner, ManagementCapAllocWorker,
     MoatWorker,
 };

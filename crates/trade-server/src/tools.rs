@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use trade_broker::PaperBrokerAdapter;
+use trade_adapters::PaperBrokerAdapter;
 use trade_core::{
     PortfolioActionPayload, PreDispatchError, RiskTier, TaskRecord,
 };

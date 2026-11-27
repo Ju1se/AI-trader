@@ -7,7 +7,7 @@ use std::env;
 use std::process;
 use std::time::Instant;
 
-use trade_cli::{
+use trade_server::{
     build_default_config, rebalance_dates, seed_pit_universe, TradeAiHarness,
 };
 use trade_core::{AsOfDate, AutonomyLevel, UsdCents};
@@ -435,7 +435,7 @@ async fn run_cli() -> Result<(), String> {
             Ok(())
         }
         other => Err(format!(
-            "Unknown command {other:?}. Usage: trade-cli <demo|backtest|research|bench>"
+            "Unknown command {other:?}. Usage: trade <demo|backtest|research|bench>"
         )),
     }
 }

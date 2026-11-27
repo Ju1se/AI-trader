@@ -21,7 +21,7 @@ use trade_core::{
 };
 use trade_gate::{GateLedger, VerifiedGateTicket};
 use trade_quant::{PitMarketSource, QuantSecurityResult};
-use trade_workers::ReadOnlyPitView;
+use trade_research::ReadOnlyPitView;
 
 static INSTALL_DRIVERS: Once = Once::new();
 static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);

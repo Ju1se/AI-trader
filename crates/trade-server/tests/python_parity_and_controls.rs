@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use trade_broker::BrokerFaultMode;
-use trade_cli::{
+use trade_adapters::BrokerFaultMode;
+use trade_server::{
     build_default_config, rebalance_dates, seed_pit_universe, CreateRebalanceDraftTool,
     CredentialVault, TradeAiHarness,
 };
@@ -18,7 +18,7 @@ use trade_quant::{
     audit_survivorship_bias_exercise, run_pit_backtest, score_pit_universe, BacktestConfig,
 };
 use trade_store::DbStore;
-use trade_workers::{
+use trade_research::{
     FootnoteForensicsWorker, InvestmentCommittee, ManagementCapAllocWorker, MoatWorker,
     ReadOnlyPitView,
 };

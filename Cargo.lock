@@ -1348,27 +1348,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "trade-broker"
+name = "trade-adapters"
 version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
  "trade-core",
-]
-
-[[package]]
-name = "trade-cli"
-version = "0.2.0"
-dependencies = [
- "serde",
- "serde_json",
- "tokio",
- "trade-broker",
- "trade-core",
- "trade-gate",
- "trade-quant",
- "trade-store",
- "trade-workers",
 ]
 
 [[package]]
@@ -1396,6 +1381,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "trade-research"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "trade-core",
+ "trade-quant",
+]
+
+[[package]]
+name = "trade-server"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "trade-adapters",
+ "trade-core",
+ "trade-gate",
+ "trade-quant",
+ "trade-research",
+ "trade-store",
+]
+
+[[package]]
 name = "trade-store"
 version = "0.2.0"
 dependencies = [
@@ -1406,16 +1415,7 @@ dependencies = [
  "trade-core",
  "trade-gate",
  "trade-quant",
- "trade-workers",
-]
-
-[[package]]
-name = "trade-workers"
-version = "0.2.0"
-dependencies = [
- "serde",
- "trade-core",
- "trade-quant",
+ "trade-research",
 ]
 
 [[package]]

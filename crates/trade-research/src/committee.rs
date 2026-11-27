@@ -1,5 +1,5 @@
 //! Investment Committee aggregation, dispersion escalation, and constrained portfolio construction.
-//! Lives inside `trade-workers` (zero database or execution coupling).
+//! Lives inside `trade-research` (zero database or execution coupling).
 
 use std::collections::BTreeMap;
 

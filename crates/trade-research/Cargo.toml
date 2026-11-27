@@ -1,11 +1,11 @@
 [package]
-name = "trade-workers"
+name = "trade-research"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 # Physical Dependency Isolation (Agent 7 2.3 & 3.5):
-# `trade-workers` CANNOT depend on `sqlx` or `trade-gate`!
+# `trade-research` CANNOT depend on `sqlx` or `trade-gate`!
 [dependencies]
 serde = { workspace = true }
 trade-core = { path = "../trade-core" }

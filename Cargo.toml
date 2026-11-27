@@ -3,11 +3,11 @@ resolver = "2"
 members = [
     "crates/trade-core",
     "crates/trade-quant",
-    "crates/trade-workers",
+    "crates/trade-research",
     "crates/trade-gate",
-    "crates/trade-broker",
+    "crates/trade-adapters",
     "crates/trade-store",
-    "crates/trade-cli",
+    "crates/trade-server",
 ]
 
 [workspace.package]
